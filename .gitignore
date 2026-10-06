@@ -1,0 +1,21 @@
+# Environment variables and secrets
+.env
+.env.local
+*.env
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# FastEmbed / ONNX cache
+.cache/
+
+# Logs
+*.log

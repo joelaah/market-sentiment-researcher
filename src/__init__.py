@@ -1,0 +1,1 @@
+# Market Sentiment Researcher package

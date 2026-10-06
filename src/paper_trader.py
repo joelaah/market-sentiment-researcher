@@ -5,6 +5,7 @@ from datetime import datetime
 from tabulate import tabulate
 import yfinance as yf
 from src.db import get_supabase_client
+from src.finbert_analyzer import FinBERTAnalyzer
 
 # Tickers to monitor for sentiment catalysts
 WATCHLIST = ["NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AMD", "SPY", "QQQ"]
@@ -271,12 +272,21 @@ class PaperTradingEngine:
             if not tech["valid"]:
                 continue
 
-            # 1. News Catalyst Score (0 to 4 points)
-            news_score = 0.0
-            if bullish_count > bearish_count:
-                news_score = min(4.0, bullish_count * 1.5)
-            elif bearish_count > bullish_count:
-                news_score = -min(4.0, bearish_count * 1.5)
+            # 1. FinBERT Financial Neural Classification Score (0 to 4 points)
+            try:
+                finbert = FinBERTAnalyzer()
+                combined_sample = f"{ticker_articles[0]['title']}. {ticker_articles[0].get('summary', '')}"
+                bert_res = finbert.analyze(combined_sample)
+                # Map net_score (-1.0 to +1.0) into news_score (-4.0 to +4.0)
+                news_score = round(bert_res["net_score"] * 4.0, 2)
+                finbert_info = f"FinBERT[Pos={bert_res['positive']:.2f}, Neg={bert_res['negative']:.2f}, Net={bert_res['net_score']:.2f}]"
+            except Exception as e:
+                news_score = 0.0
+                if bullish_count > bearish_count:
+                    news_score = min(4.0, bullish_count * 1.5)
+                elif bearish_count > bullish_count:
+                    news_score = -min(4.0, bearish_count * 1.5)
+                finbert_info = f"Keywords(+{bullish_count}/-{bearish_count})"
 
             # 2. Trend Confirmation Score (0 to 3 points)
             # Above 20-day SMA confirms upward momentum (protects against falling knives)
@@ -290,29 +300,29 @@ class PaperTradingEngine:
             rr_score = 1.0
 
             # Total Conviction Score out of 10
-            conviction_score = round(news_score + trend_score + momentum_score + rr_score, 1)
+            conviction_score = round(max(0.0, news_score) + trend_score + momentum_score + rr_score, 1)
 
-            print(f"[Conviction Analysis] {ticker}: Score {conviction_score}/10 | News: +{bullish_count}/-{bearish_count} | Price: ${tech['price']} (SMA20: ${tech['sma20']}) | 5d: {tech['momentum_5d']}%")
+            print(f"[Conviction Analysis] {ticker}: Score {conviction_score}/10 | {finbert_info} | Price: ${tech['price']} (SMA20: ${tech['sma20']}) | 5d: {tech['momentum_5d']}%")
 
             # HIGH-CONVICTION BUY TRIGGER (Must score >= 7.0 / 10 to enter trade)
-            if conviction_score >= 7.0 and bullish_count >= 1 and tech["above_sma20"]:
+            if conviction_score >= 7.0 and news_score >= 1.5 and tech["above_sma20"]:
                 max_trade_size = round(min(updated_port["total_equity"] * 0.15, 750.0), 2)
                 if updated_port["cash"] >= max_trade_size and ticker not in [p["symbol"] for p in updated_port["positions"]]:
                     rationale = (
                         f"High-Conviction BUY (Score {conviction_score}/10). "
-                        f"Catalyst: '{latest_headline[:60]}...'. "
-                        f"Trend Confirmed: Price ${tech['price']} > 20d SMA ${tech['sma20']} (5d: +{tech['momentum_5d']}%). "
-                        f"Target: +8%, Stop: -4%."
+                        f"FinBERT Signal: {finbert_info}. "
+                        f"Catalyst: '{latest_headline[:50]}...'. "
+                        f"Trend: Price ${tech['price']} > 20d SMA ${tech['sma20']} (5d: +{tech['momentum_5d']}%)."
                     )
                     self.execute_buy(ticker, max_trade_size, rationale)
-            elif conviction_score < 7.0 and bullish_count >= 1:
+            elif conviction_score < 7.0 and news_score > 0:
                 print(f"   ↳ ⏭️ Skipped BUY for {ticker}: Conviction {conviction_score}/10 is below 7.0 threshold (needs technical trend confirmation).")
 
             # HIGH-CONVICTION SELL TRIGGER (Exit on severe bearish news or breakdown)
-            elif (bearish_count >= 2 and bearish_count > bullish_count) or (not tech["above_sma20"] and tech["momentum_5d"] < -3.0):
+            elif news_score <= -2.0 or (not tech["above_sma20"] and tech["momentum_5d"] < -3.0):
                 for p in updated_port["positions"]:
                     if p["symbol"] == ticker:
-                        rationale = f"Exit triggered: Bearish catalyst / breakdown (News: -{bearish_count}, 5d: {tech['momentum_5d']}%)"
+                        rationale = f"Exit triggered: Bearish FinBERT signal ({finbert_info}, 5d: {tech['momentum_5d']}%)"
                         self.execute_sell(ticker, p["shares"], rationale)
 
     def print_dashboard(self):

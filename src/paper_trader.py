@@ -17,18 +17,42 @@ def get_current_price(symbol: str) -> Optional[float]:
     """Fetches real-time / latest market price for a given ticker."""
     try:
         ticker = yf.Ticker(symbol)
-        # Fast quote lookup
         fast_info = ticker.fast_info
         if fast_info and fast_info.last_price:
             return round(float(fast_info.last_price), 2)
-        
-        # Fallback to 1d history
         hist = ticker.history(period="1d")
         if not hist.empty:
             return round(float(hist["Close"].iloc[-1]), 2)
     except Exception as e:
         print(f"[PaperTrader] Error fetching price for {symbol}: {e}")
     return None
+
+def get_stock_technical_signal(symbol: str) -> Dict[str, Any]:
+    """
+    Analyzes technical momentum (20-day Simple Moving Average & 5-day return)
+    to confirm whether price trend confirms positive news (avoids catching falling knives).
+    """
+    try:
+        t = yf.Ticker(symbol)
+        hist = t.history(period="1mo")
+        if len(hist) < 10:
+            return {"valid": False, "price": 0.0, "above_sma20": False, "momentum_5d": 0.0}
+        
+        cur_price = float(hist["Close"].iloc[-1])
+        sma20 = float(hist["Close"].tail(min(20, len(hist))).mean())
+        price_5d_ago = float(hist["Close"].iloc[-min(5, len(hist))])
+        momentum_5d = round(((cur_price - price_5d_ago) / price_5d_ago) * 100, 2)
+        
+        return {
+            "valid": True,
+            "price": round(cur_price, 2),
+            "sma20": round(sma20, 2),
+            "above_sma20": cur_price >= sma20,
+            "momentum_5d": momentum_5d
+        }
+    except Exception as e:
+        return {"valid": False, "price": 0.0, "above_sma20": False, "momentum_5d": 0.0}
+
 
 class PaperTradingEngine:
     def __init__(self):
@@ -242,19 +266,53 @@ class PaperTradingEngine:
                 bullish_count += sum(1 for kw in BULLISH_SIGNALS if kw in combined_text)
                 bearish_count += sum(1 for kw in BEARISH_SIGNALS if kw in combined_text)
 
-            # Buy Decision
-            if bullish_count > bearish_count and bullish_count >= 1:
-                # Allocation: 15% of portfolio (~$750 max per trade)
+            # Multi-Factor Prediction & Conviction Analysis
+            tech = get_stock_technical_signal(ticker)
+            if not tech["valid"]:
+                continue
+
+            # 1. News Catalyst Score (0 to 4 points)
+            news_score = 0.0
+            if bullish_count > bearish_count:
+                news_score = min(4.0, bullish_count * 1.5)
+            elif bearish_count > bullish_count:
+                news_score = -min(4.0, bearish_count * 1.5)
+
+            # 2. Trend Confirmation Score (0 to 3 points)
+            # Above 20-day SMA confirms upward momentum (protects against falling knives)
+            trend_score = 3.0 if tech["above_sma20"] else 0.0
+
+            # 3. Short-term Momentum Score (0 to 2 points)
+            momentum_score = 2.0 if tech["momentum_5d"] > 0.5 else (1.0 if tech["momentum_5d"] >= 0 else 0.0)
+
+            # 4. Risk / Reward Profile (1 point)
+            # Strict stop loss -4%, target +8% -> 2.0x ratio
+            rr_score = 1.0
+
+            # Total Conviction Score out of 10
+            conviction_score = round(news_score + trend_score + momentum_score + rr_score, 1)
+
+            print(f"[Conviction Analysis] {ticker}: Score {conviction_score}/10 | News: +{bullish_count}/-{bearish_count} | Price: ${tech['price']} (SMA20: ${tech['sma20']}) | 5d: {tech['momentum_5d']}%")
+
+            # HIGH-CONVICTION BUY TRIGGER (Must score >= 7.0 / 10 to enter trade)
+            if conviction_score >= 7.0 and bullish_count >= 1 and tech["above_sma20"]:
                 max_trade_size = round(min(updated_port["total_equity"] * 0.15, 750.0), 2)
                 if updated_port["cash"] >= max_trade_size and ticker not in [p["symbol"] for p in updated_port["positions"]]:
-                    rationale = f"Bullish catalyst detected (score +{bullish_count}): '{latest_headline}'"
+                    rationale = (
+                        f"High-Conviction BUY (Score {conviction_score}/10). "
+                        f"Catalyst: '{latest_headline[:60]}...'. "
+                        f"Trend Confirmed: Price ${tech['price']} > 20d SMA ${tech['sma20']} (5d: +{tech['momentum_5d']}%). "
+                        f"Target: +8%, Stop: -4%."
+                    )
                     self.execute_buy(ticker, max_trade_size, rationale)
+            elif conviction_score < 7.0 and bullish_count >= 1:
+                print(f"   ↳ ⏭️ Skipped BUY for {ticker}: Conviction {conviction_score}/10 is below 7.0 threshold (needs technical trend confirmation).")
 
-            # Sell Decision on bad news
-            elif bearish_count > bullish_count and bearish_count >= 2:
+            # HIGH-CONVICTION SELL TRIGGER (Exit on severe bearish news or breakdown)
+            elif (bearish_count >= 2 and bearish_count > bullish_count) or (not tech["above_sma20"] and tech["momentum_5d"] < -3.0):
                 for p in updated_port["positions"]:
                     if p["symbol"] == ticker:
-                        rationale = f"Bearish catalyst detected (score -{bearish_count}): '{latest_headline}'"
+                        rationale = f"Exit triggered: Bearish catalyst / breakdown (News: -{bearish_count}, 5d: {tech['momentum_5d']}%)"
                         self.execute_sell(ticker, p["shares"], rationale)
 
     def print_dashboard(self):

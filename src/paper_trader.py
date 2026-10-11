@@ -230,11 +230,11 @@ class PaperTradingEngine:
         port = self.get_portfolio_status()
         print(f"Current Portfolio: Cash ${port['cash']:.2f} | Total Equity: ${port['total_equity']:.2f}")
 
-        # Check existing holdings for Stop Loss (-5%) or Take Profit (+8%)
+        # Check existing holdings for Stop Loss (-7.5%) or Take Profit (+12.0%)
         for pos in port["positions"]:
-            if pos["pnl_pct"] >= 8.0:
+            if pos["pnl_pct"] >= 12.0:
                 self.execute_sell(pos["symbol"], pos["shares"], f"Take Profit triggered: Position reached +{pos['pnl_pct']:.2f}% gain.")
-            elif pos["pnl_pct"] <= -5.0:
+            elif pos["pnl_pct"] <= -7.5:
                 self.execute_sell(pos["symbol"], pos["shares"], f"Stop Loss triggered: Cut loss at {pos['pnl_pct']:.2f}%.")
 
         # Fetch latest 25 articles from Supabase
@@ -296,7 +296,7 @@ class PaperTradingEngine:
             momentum_score = 2.0 if tech["momentum_5d"] > 0.5 else (1.0 if tech["momentum_5d"] >= 0 else 0.0)
 
             # 4. Risk / Reward Profile (1 point)
-            # Strict stop loss -4%, target +8% -> 2.0x ratio
+            # Swing stop loss -7.5%, target +12.0% -> 1.6x ratio
             rr_score = 1.0
 
             # Total Conviction Score out of 10

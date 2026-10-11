@@ -14,6 +14,14 @@ FEEDS = [
         "url": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml"
     },
     {
+        "source": "Google Finance Global Markets",
+        "url": "https://news.google.com/rss/search?q=global+markets+stocks+europe+asia&hl=en-US&gl=US&ceid=US:en"
+    },
+    {
+        "source": "CNBC International Markets",
+        "url": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
+    },
+    {
         "source": "Google Finance & Economy",
         "url": "https://news.google.com/rss/search?q=stock+market+economy&hl=en-US&gl=US&ceid=US:en"
     }

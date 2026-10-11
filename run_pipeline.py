@@ -54,31 +54,41 @@ def run_interactive_research():
         except (KeyboardInterrupt, EOFError):
             break
 
-from src.paper_trader import PaperTradingEngine
+from src.paper_trader import MultiBotTournamentEngine, PaperTradingEngine
 
 def run_paper_trading():
     missing = check_config()
     if missing:
         print(f"[Error] Missing Supabase configuration in .env: {', '.join(missing)}")
         sys.exit(1)
-    engine = PaperTradingEngine()
-    engine.evaluate_news_and_trade()
-    engine.print_dashboard()
+    engine = MultiBotTournamentEngine()
+    engine.evaluate_tournament()
+    engine.print_leaderboard()
 
-def run_portfolio_view():
+def run_portfolio_view(bot_id: str = None):
     missing = check_config()
     if missing:
         print(f"[Error] Missing Supabase configuration in .env: {', '.join(missing)}")
         sys.exit(1)
-    engine = PaperTradingEngine()
-    engine.print_dashboard()
+    engine = MultiBotTournamentEngine()
+    engine.print_leaderboard()
+
+def run_borderlist_view():
+    missing = check_config()
+    if missing:
+        print(f"[Error] Missing Supabase configuration in .env: {', '.join(missing)}")
+        sys.exit(1)
+    engine = MultiBotTournamentEngine()
+    engine.print_borderlist()
 
 def main():
-    parser = argparse.ArgumentParser(description="Financial News Scraper & Supabase Vector Research Assistant")
+    parser = argparse.ArgumentParser(description="Financial News Scraper, Supabase pgvector & Multi-Bot Trading Tournament")
     parser.add_argument("--scrape", action="store_true", help="Scrape latest financial news and index into Supabase")
     parser.add_argument("--query", type=str, help="Perform a semantic search query against indexed news")
-    parser.add_argument("--trade", action="store_true", help="Evaluate latest news and execute paper trades on $5,000 portfolio")
-    parser.add_argument("--portfolio", action="store_true", help="View current paper trading portfolio performance")
+    parser.add_argument("--trade", action="store_true", help="Evaluate all 5 AI bots simultaneously in Multi-Bot Tournament")
+    parser.add_argument("--portfolio", "--leaderboard", dest="portfolio", action="store_true", help="View Live Multi-Bot Tournament Leaderboard")
+    parser.add_argument("--borderlist", action="store_true", help="View Safety Borderlist & Guardrails status (disqualified tickers)")
+    parser.add_argument("--bot", type=str, default=None, help="Specific bot ID to inspect (optional)")
     
     args = parser.parse_args()
 
@@ -87,7 +97,9 @@ def main():
     elif args.trade:
         run_paper_trading()
     elif args.portfolio:
-        run_portfolio_view()
+        run_portfolio_view(args.bot)
+    elif args.borderlist:
+        run_borderlist_view()
     elif args.query:
         missing = check_config()
         if missing:
@@ -99,14 +111,15 @@ def main():
     else:
         # Default menu
         print("=====================================================")
-        print("   AI MARKET RESEARCH & $5,000 PAPER TRADING BOT     ")
+        print("   AI MARKET RESEARCH & MULTI-BOT TOURNAMENT ARENA   ")
         print("=====================================================")
         print("1. Scrape latest market feeds and index into Supabase")
         print("2. Ask research questions / Semantic vector search")
-        print("3. Run AI Paper Trading strategy evaluation")
-        print("4. View $5,000 Paper Trading portfolio performance")
-        print("5. Exit")
-        choice = input("Select an option (1-5): ").strip()
+        print("3. Run Multi-Bot Tournament evaluation & paper trading")
+        print("4. View Live Multi-Bot Tournament Leaderboard")
+        print("5. View Safety Borderlist & Guardrails status")
+        print("6. Exit")
+        choice = input("Select an option (1-6): ").strip()
 
         if choice == "1":
             run_scraper_and_indexing()
@@ -116,6 +129,8 @@ def main():
             run_paper_trading()
         elif choice == "4":
             run_portfolio_view()
+        elif choice == "5":
+            run_borderlist_view()
         else:
             print("Exiting.")
 

@@ -19,3 +19,7 @@ env/
 
 # Logs
 *.log
+
+# Local tournament cache
+data/
+*.json.bak

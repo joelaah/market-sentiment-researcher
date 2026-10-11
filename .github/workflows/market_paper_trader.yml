@@ -1,4 +1,4 @@
-name: Market Intelligence & $5,000 Paper Trading Bot
+name: Market Intelligence & Multi-Bot Trading Tournament
 
 on:
   schedule:
@@ -32,7 +32,7 @@ jobs:
         run: |
           python run_pipeline.py --scrape
 
-      - name: Execute Paper Trading Strategy & Update Portfolio
+      - name: Execute Multi-Bot Tournament & Publish Live Leaderboard
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

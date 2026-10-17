@@ -65,7 +65,7 @@ def safe_print(*args, **kwargs):
             ]
             print(*clean_args, **kwargs)
 
-from src.db import get_supabase_client
+from src.db import get_supabase_client, load_calibrated_parameters
 from src.finbert_analyzer import FinBERTAnalyzer
 from src.telegram_notifier import notify_trade
 
@@ -748,18 +748,124 @@ class BotArchetype:
         allocation_pct: float = 0.15,
         max_trade_dollars: float = 750.00,
         stop_loss_pct: float = -7.5,
-        take_profit_pct: float = 12.0
+        take_profit_pct: float = 12.0,
+        params: Optional[Dict[str, Any]] = None,
+        **kwargs
     ):
-        self.bot_id = bot_id
-        self.name = name
-        self.persona = persona
-        self.description = description
-        self.starting_balance = starting_balance
-        self.max_positions = max_positions
-        self.allocation_pct = allocation_pct
-        self.max_trade_dollars = max_trade_dollars
-        self.stop_loss_pct = stop_loss_pct
-        self.take_profit_pct = take_profit_pct
+        cfg: Dict[str, Any] = {}
+        if params:
+            cfg.update(params)
+        if kwargs:
+            cfg.update(kwargs)
+
+        self.bot_id = str(cfg.get("bot_id", bot_id))
+        self.name = str(cfg.get("name", name))
+        self.persona = str(cfg.get("persona", persona))
+        self.description = str(cfg.get("description", description))
+        self.starting_balance = float(cfg.get("starting_balance", starting_balance))
+        self.max_positions = int(cfg.get("max_positions", max_positions))
+        self.allocation_pct = float(cfg.get("allocation_pct", allocation_pct))
+
+        # If allocation_pct was customized but max_trade_dollars was not, scale max_trade_dollars proportionally
+        default_scaled_trade_dollars = max(max_trade_dollars, round(self.starting_balance * self.allocation_pct, 2))
+        self.max_trade_dollars = float(cfg.get("max_trade_dollars", default_scaled_trade_dollars if "allocation_pct" in cfg else max_trade_dollars))
+
+        # Stop loss handling: support 'stop_loss_pct' or 'stop_loss', enforce negative float
+        raw_sl = cfg.get("stop_loss_pct", cfg.get("stop_loss", stop_loss_pct))
+        self.stop_loss_pct = -abs(float(raw_sl)) if raw_sl is not None else -7.5
+
+        # Take profit handling: support 'take_profit_pct' or 'take_profit', enforce positive float
+        raw_tp = cfg.get("take_profit_pct", cfg.get("take_profit", take_profit_pct))
+        self.take_profit_pct = abs(float(raw_tp)) if raw_tp is not None else 12.0
+
+        # Trailing stop: optional
+        raw_ts = cfg.get("trailing_stop_pct", cfg.get("trailing_stop", None))
+        self.trailing_stop_pct = abs(float(raw_ts)) if raw_ts is not None else None
+
+        # Persona-specific overrides dictionary
+        self.params: Dict[str, Any] = {
+            "starting_balance": self.starting_balance,
+            "max_positions": self.max_positions,
+            "allocation_pct": self.allocation_pct,
+            "max_trade_dollars": self.max_trade_dollars,
+            "stop_loss_pct": self.stop_loss_pct,
+            "take_profit_pct": self.take_profit_pct,
+            "trailing_stop_pct": self.trailing_stop_pct,
+            **cfg
+        }
+
+    def get_params(self) -> Dict[str, Any]:
+        """Returns active parameter dictionary."""
+        return dict(self.params)
+
+    def set_params(self, **new_params) -> "BotArchetype":
+        """Dynamically updates active parameters and operational persona attributes."""
+        self.params.update(new_params)
+
+        # Standard capital and risk parameters
+        if "max_positions" in new_params:
+            self.max_positions = int(new_params["max_positions"])
+        if "allocation_pct" in new_params:
+            self.allocation_pct = float(new_params["allocation_pct"])
+            if "max_trade_dollars" not in new_params:
+                self.max_trade_dollars = round(self.starting_balance * self.allocation_pct, 2)
+                self.params["max_trade_dollars"] = self.max_trade_dollars
+        if "max_trade_dollars" in new_params:
+            self.max_trade_dollars = float(new_params["max_trade_dollars"])
+        if "stop_loss_pct" in new_params or "stop_loss" in new_params:
+            val = new_params.get("stop_loss_pct", new_params.get("stop_loss"))
+            self.stop_loss_pct = -abs(float(val))
+            self.params["stop_loss_pct"] = self.stop_loss_pct
+        if "take_profit_pct" in new_params or "take_profit" in new_params:
+            val = new_params.get("take_profit_pct", new_params.get("take_profit"))
+            self.take_profit_pct = abs(float(val))
+            self.params["take_profit_pct"] = self.take_profit_pct
+        if "trailing_stop_pct" in new_params or "trailing_stop" in new_params:
+            raw_ts = new_params.get("trailing_stop_pct", new_params.get("trailing_stop"))
+            self.trailing_stop_pct = abs(float(raw_ts)) if raw_ts is not None else None
+            self.params["trailing_stop_pct"] = self.trailing_stop_pct
+
+        # Persona-specific indicator thresholds
+        if "min_momentum_5d" in new_params or "momentum_threshold" in new_params:
+            val = float(new_params.get("min_momentum_5d", new_params.get("momentum_threshold")))
+            self.min_momentum_5d = val
+            self.params["min_momentum_5d"] = val
+        if "conviction_threshold" in new_params or "min_conviction" in new_params:
+            val = float(new_params.get("conviction_threshold", new_params.get("min_conviction")))
+            self.conviction_threshold = val
+            self.params["conviction_threshold"] = val
+            if hasattr(self, "min_net_score") and self.bot_id == "finbert_catalyst_hunter":
+                self.min_net_score = val
+        if "dip_threshold_pct" in new_params or "dip_max_pct" in new_params:
+            val = float(new_params.get("dip_threshold_pct", new_params.get("dip_max_pct")))
+            self.dip_max_pct = val
+            self.dip_threshold_pct = val
+            self.params["dip_threshold_pct"] = val
+        if "dip_min_pct" in new_params or "dip_lower_bound" in new_params:
+            val = float(new_params.get("dip_min_pct", new_params.get("dip_lower_bound")))
+            self.dip_min_pct = val
+            self.dip_lower_bound = val
+            self.params["dip_min_pct"] = val
+        if "min_net_score" in new_params:
+            self.min_net_score = float(new_params["min_net_score"])
+            self.params["min_net_score"] = self.min_net_score
+        if "min_news_score" in new_params:
+            self.min_news_score = float(new_params["min_news_score"])
+            self.params["min_news_score"] = self.min_news_score
+
+        # Generic attribute fallback for any additional persona attributes
+        for k, v in new_params.items():
+            if hasattr(self, k) and not callable(getattr(self, k)) and k not in {"bot_id", "name", "persona", "description", "params"}:
+                attr_type = type(getattr(self, k))
+                try:
+                    if attr_type in (int, float):
+                        setattr(self, k, attr_type(v))
+                    elif attr_type is bool:
+                        setattr(self, k, bool(v))
+                except Exception:
+                    pass
+
+        return self
 
     def compute_conviction(self, news_score: float, tech: Dict[str, Any]) -> float:
         """Standard multi-factor conviction score (0 to 10 points)."""
@@ -799,19 +905,45 @@ class ConservativeSwingBot(BotArchetype):
     Requires high AI conviction (>= 7.0/10), positive FinBERT (news_score >= 1.5),
     and price strictly above 20-day SMA to confirm upward trend.
     """
-    def __init__(self):
+    DEFAULT_PARAMS = {
+        "starting_balance": 5000.00,
+        "max_positions": 5,
+        "allocation_pct": 0.15,
+        "max_trade_dollars": 750.00,
+        "stop_loss_pct": -7.5,
+        "take_profit_pct": 12.0,
+        "conviction_threshold": 7.0,
+        "min_news_score": 1.5,
+        "exit_news_score": -2.0,
+        "exit_mom_5d": -3.0,
+        "min_momentum_5d": 0.0
+    }
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None, **kwargs):
+        merged = dict(self.DEFAULT_PARAMS)
+        if params:
+            merged.update(params)
+        if kwargs:
+            merged.update(kwargs)
+
         super().__init__(
-            bot_id="conservative_swing",
-            name="Conservative Swing",
-            persona="Risk-Managed Swing Trader",
-            description="High-conviction swing strategy requiring AI sentiment + confirmed technical trend alignment.",
-            starting_balance=5000.00,
-            max_positions=5,
-            allocation_pct=0.15,
-            max_trade_dollars=750.00,
-            stop_loss_pct=-7.5,
-            take_profit_pct=12.0
+            bot_id=merged.get("bot_id", "conservative_swing"),
+            name=merged.get("name", "Conservative Swing"),
+            persona=merged.get("persona", "Risk-Managed Swing Trader"),
+            description=merged.get("description", "High-conviction swing strategy requiring AI sentiment + confirmed technical trend alignment."),
+            starting_balance=merged["starting_balance"],
+            max_positions=merged["max_positions"],
+            allocation_pct=merged["allocation_pct"],
+            max_trade_dollars=merged["max_trade_dollars"],
+            stop_loss_pct=merged["stop_loss_pct"],
+            take_profit_pct=merged["take_profit_pct"],
+            params=merged
         )
+        self.conviction_threshold = float(merged.get("conviction_threshold", merged.get("min_conviction", 7.0)))
+        self.min_news_score = float(merged.get("min_news_score", 1.5))
+        self.exit_news_score = float(merged.get("exit_news_score", -2.0))
+        self.exit_mom_5d = float(merged.get("exit_mom_5d", merged.get("exit_momentum_5d", -3.0)))
+        self.min_momentum_5d = float(merged.get("min_momentum_5d", 0.0))
 
     def evaluate_entry(self, ticker: str, tech: Dict[str, Any], bert: Dict[str, Any], articles: List[Dict[str, Any]], current_positions: List[str]) -> Tuple[bool, float, str]:
         if not tech.get("valid", False) or not articles:
@@ -819,12 +951,13 @@ class ConservativeSwingBot(BotArchetype):
 
         news_score = bert.get("news_score", 0.0)
         conviction = self.compute_conviction(news_score, tech)
+        mom_5d = tech.get("momentum_5d", 0.0)
 
-        if conviction >= 7.0 and news_score >= 1.5 and tech.get("above_sma20", False):
+        if conviction >= self.conviction_threshold and news_score >= self.min_news_score and tech.get("above_sma20", False) and mom_5d >= self.min_momentum_5d:
             rationale = (
                 f"Conservative Swing BUY (Score {conviction}/10). "
                 f"Sentiment: {bert.get('info')}. "
-                f"Trend: ${tech.get('price')} > 20d SMA ${tech.get('sma20')} (5d: +{tech.get('momentum_5d')}%, SL -7.5%, TP +12.0%)."
+                f"Trend: ${tech.get('price')} > 20d SMA ${tech.get('sma20')} (5d: +{tech.get('momentum_5d')}%, SL {self.stop_loss_pct:.1f}%, TP +{self.take_profit_pct:.1f}%)."
             )
             return True, conviction, rationale
         return False, conviction, ""
@@ -836,7 +969,7 @@ class ConservativeSwingBot(BotArchetype):
 
         news_score = bert.get("news_score", 0.0)
         # Severe sentiment breakdown or breakdown below SMA with sharp momentum fall
-        if news_score <= -2.0 or (not tech.get("above_sma20", True) and tech.get("momentum_5d", 0.0) < -3.0):
+        if news_score <= self.exit_news_score or (not tech.get("above_sma20", True) and tech.get("momentum_5d", 0.0) < self.exit_mom_5d):
             return True, f"Risk Exit: Bearish breakdown ({bert.get('info')}, 5d: {tech.get('momentum_5d', 0.0)}%)."
         return False, ""
 
@@ -847,19 +980,43 @@ class AggressiveBreakoutBot(BotArchetype):
     Looks for strong 5-day velocity (>= +2.0%), price pressing above SMA20,
     and non-negative news catalyst. Employs tighter stop losses and ambitious profit targets.
     """
-    def __init__(self):
+    DEFAULT_PARAMS = {
+        "starting_balance": 5000.00,
+        "max_positions": 4,
+        "allocation_pct": 0.25,
+        "max_trade_dollars": 1250.00,
+        "stop_loss_pct": -5.0,
+        "take_profit_pct": 18.0,
+        "min_momentum_5d": 2.0,
+        "min_net_score": 0.05,
+        "exit_mom_stall": -1.5,
+        "exit_sma_breakdown_mom": 0.0
+    }
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None, **kwargs):
+        merged = dict(self.DEFAULT_PARAMS)
+        if params:
+            merged.update(params)
+        if kwargs:
+            merged.update(kwargs)
+
         super().__init__(
-            bot_id="aggressive_breakout",
-            name="Aggressive Breakout",
-            persona="High-Momentum Breakout Chaser",
-            description="Aggressive velocity strategy seeking explosive breakouts with tight 5% stops and 18% upside.",
-            starting_balance=5000.00,
-            max_positions=4,
-            allocation_pct=0.25,
-            max_trade_dollars=1250.00,
-            stop_loss_pct=-5.0,
-            take_profit_pct=18.0
+            bot_id=merged.get("bot_id", "aggressive_breakout"),
+            name=merged.get("name", "Aggressive Breakout"),
+            persona=merged.get("persona", "High-Momentum Breakout Chaser"),
+            description=merged.get("description", "Aggressive velocity strategy seeking explosive breakouts with tight 5% stops and 18% upside."),
+            starting_balance=merged["starting_balance"],
+            max_positions=merged["max_positions"],
+            allocation_pct=merged["allocation_pct"],
+            max_trade_dollars=merged["max_trade_dollars"],
+            stop_loss_pct=merged["stop_loss_pct"],
+            take_profit_pct=merged["take_profit_pct"],
+            params=merged
         )
+        self.min_momentum_5d = float(merged.get("min_momentum_5d", merged.get("momentum_threshold", 2.0)))
+        self.min_net_score = float(merged.get("min_net_score", 0.05))
+        self.exit_mom_stall = float(merged.get("exit_mom_stall", -1.5))
+        self.exit_sma_breakdown_mom = float(merged.get("exit_sma_breakdown_mom", 0.0))
 
     def evaluate_entry(self, ticker: str, tech: Dict[str, Any], bert: Dict[str, Any], articles: List[Dict[str, Any]], current_positions: List[str]) -> Tuple[bool, float, str]:
         if not tech.get("valid", False):
@@ -870,11 +1027,11 @@ class AggressiveBreakoutBot(BotArchetype):
         above_sma = tech.get("above_sma20", False)
 
         # Triggers on strong positive velocity + above SMA + non-negative news
-        if mom_5d >= 2.0 and above_sma and net_score >= 0.05:
+        if mom_5d >= self.min_momentum_5d and above_sma and net_score >= self.min_net_score:
             conviction = round(min(10.0, 5.0 + (mom_5d * 0.8) + max(0.0, net_score * 3.0)), 1)
             rationale = (
                 f"Aggressive Breakout BUY. Strong 5d velocity +{mom_5d}% > SMA20 (${tech.get('price')} > ${tech.get('sma20')}). "
-                f"Sentiment: {bert.get('info')}. Target: +18%, Stop: -5%."
+                f"Sentiment: {bert.get('info')}. Target: +{self.take_profit_pct:.1f}%, Stop: {self.stop_loss_pct:.1f}%."
             )
             return True, conviction, rationale
         return False, 0.0, ""
@@ -886,7 +1043,7 @@ class AggressiveBreakoutBot(BotArchetype):
 
         mom_5d = tech.get("momentum_5d", 0.0)
         # Momentum stall or price falling back below SMA
-        if mom_5d < -1.5 or (not tech.get("above_sma20", True) and mom_5d < 0.0):
+        if mom_5d < self.exit_mom_stall or (not tech.get("above_sma20", True) and mom_5d < self.exit_sma_breakdown_mom):
             return True, f"Breakout Stall: Velocity collapsed ({mom_5d}%), exiting to protect capital."
         return False, ""
 
@@ -897,19 +1054,52 @@ class ContrarianDipBuyerBot(BotArchetype):
     Buys short-term pullbacks (-1.5% to -8.0% 5-day return) on solid stocks
     where news is stabilizing/not disastrous, anticipating a sharp rebound.
     """
-    def __init__(self):
+    DEFAULT_PARAMS = {
+        "starting_balance": 5000.00,
+        "max_positions": 5,
+        "allocation_pct": 0.20,
+        "max_trade_dollars": 1000.00,
+        "stop_loss_pct": -6.0,
+        "take_profit_pct": 8.0,
+        "dip_min_pct": -8.0,
+        "dip_max_pct": -1.5,
+        "dip_threshold_pct": -1.5,
+        "min_net_score": -0.20,
+        "sma_distance_factor": 0.95,
+        "exit_mom_collapse": -9.0,
+        "exit_net_score": -0.35,
+        "exit_news_score": -1.5
+    }
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None, **kwargs):
+        merged = dict(self.DEFAULT_PARAMS)
+        if params:
+            merged.update(params)
+        if kwargs:
+            merged.update(kwargs)
+
         super().__init__(
-            bot_id="contrarian_dip_buyer",
-            name="Dip Buyer / Contrarian",
-            persona="Mean-Reversion Value Seeker",
-            description="Buys oversold short-term dips on quality tickers with stabilizing sentiment for quick rebound gains.",
-            starting_balance=5000.00,
-            max_positions=5,
-            allocation_pct=0.20,
-            max_trade_dollars=1000.00,
-            stop_loss_pct=-6.0,
-            take_profit_pct=8.0
+            bot_id=merged.get("bot_id", "contrarian_dip_buyer"),
+            name=merged.get("name", "Dip Buyer / Contrarian"),
+            persona=merged.get("persona", "Mean-Reversion Value Seeker"),
+            description=merged.get("description", "Buys oversold short-term dips on quality tickers with stabilizing sentiment for quick rebound gains."),
+            starting_balance=merged["starting_balance"],
+            max_positions=merged["max_positions"],
+            allocation_pct=merged["allocation_pct"],
+            max_trade_dollars=merged["max_trade_dollars"],
+            stop_loss_pct=merged["stop_loss_pct"],
+            take_profit_pct=merged["take_profit_pct"],
+            params=merged
         )
+        self.dip_min_pct = float(merged.get("dip_min_pct", merged.get("dip_lower_bound", -8.0)))
+        self.dip_max_pct = float(merged.get("dip_max_pct", merged.get("dip_threshold_pct", merged.get("dip_upper_bound", -1.5))))
+        self.dip_threshold_pct = self.dip_max_pct
+        self.dip_lower_bound = self.dip_min_pct
+        self.min_net_score = float(merged.get("min_net_score", -0.20))
+        self.sma_distance_factor = float(merged.get("sma_distance_factor", 0.95))
+        self.exit_mom_collapse = float(merged.get("exit_mom_collapse", -9.0))
+        self.exit_net_score = float(merged.get("exit_net_score", -0.35))
+        self.exit_news_score = float(merged.get("exit_news_score", -1.5))
 
     def evaluate_entry(self, ticker: str, tech: Dict[str, Any], bert: Dict[str, Any], articles: List[Dict[str, Any]], current_positions: List[str]) -> Tuple[bool, float, str]:
         if not tech.get("valid", False):
@@ -920,12 +1110,12 @@ class ContrarianDipBuyerBot(BotArchetype):
         price = tech.get("price", 0.0)
         sma20 = tech.get("sma20", 0.0)
 
-        # Looking for dip of -1.5% to -8.0%, price near SMA20 (within 5%), sentiment not catastrophic
-        if -8.0 <= mom_5d <= -1.5 and net_score >= -0.20 and (price >= sma20 * 0.95):
+        # Looking for dip of dip_min_pct to dip_max_pct, price near SMA20, sentiment not catastrophic
+        if self.dip_min_pct <= mom_5d <= self.dip_max_pct and net_score >= self.min_net_score and (price >= sma20 * self.sma_distance_factor):
             conviction = round(min(10.0, 6.0 + abs(mom_5d) * 0.4 + max(0.0, net_score * 2.0)), 1)
             rationale = (
-                f"Contrarian Dip BUY. Oversold pullback ({mom_5d}% 5d drop), price ${price} within 5% of SMA20 (${sma20}). "
-                f"News sentiment stable ({bert.get('info')}). Target: +8.0% bounce."
+                f"Contrarian Dip BUY. Oversold pullback ({mom_5d}% 5d drop), price ${price} within {(1-self.sma_distance_factor)*100:.0f}% of SMA20 (${sma20}). "
+                f"News sentiment stable ({bert.get('info')}). Target: +{self.take_profit_pct:.1f}% bounce."
             )
             return True, conviction, rationale
         return False, 0.0, ""
@@ -938,8 +1128,8 @@ class ContrarianDipBuyerBot(BotArchetype):
         net_score = bert.get("net_score", 0.0)
         news_score = bert.get("news_score", 0.0)
         mom_5d = tech.get("momentum_5d", 0.0)
-        # If dip turns into structural collapse (technicals broke or news sentiment turned sharply negative)
-        if mom_5d < -9.0 or net_score <= -0.35 or news_score <= -1.5:
+        # If dip turns into structural collapse
+        if mom_5d < self.exit_mom_collapse or net_score <= self.exit_net_score or news_score <= self.exit_news_score:
             return True, f"Dip Invalidation: Severe deterioration (5d: {mom_5d}%, news net: {net_score:.2f})."
         return False, ""
 
@@ -950,19 +1140,43 @@ class FinBERTCatalystHunterBot(BotArchetype):
     Pounces aggressively on high-conviction positive NLP classifications
     (net score >= +0.55 or positive probability >= 0.70).
     """
-    def __init__(self):
+    DEFAULT_PARAMS = {
+        "starting_balance": 5000.00,
+        "max_positions": 5,
+        "allocation_pct": 0.20,
+        "max_trade_dollars": 1000.00,
+        "stop_loss_pct": -7.0,
+        "take_profit_pct": 10.0,
+        "min_pos_prob": 0.70,
+        "min_net_score": 0.50,
+        "conviction_threshold": 0.50,
+        "exit_net_score": -0.40
+    }
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None, **kwargs):
+        merged = dict(self.DEFAULT_PARAMS)
+        if params:
+            merged.update(params)
+        if kwargs:
+            merged.update(kwargs)
+
         super().__init__(
-            bot_id="finbert_catalyst_hunter",
-            name="FinBERT Catalyst Hunter",
-            persona="AI NLP Catalyst Sniper",
-            description="Pure sentiment intelligence strategy exploiting institutional NLP conviction surges and breaking catalysts.",
-            starting_balance=5000.00,
-            max_positions=5,
-            allocation_pct=0.20,
-            max_trade_dollars=1000.00,
-            stop_loss_pct=-7.0,
-            take_profit_pct=10.0
+            bot_id=merged.get("bot_id", "finbert_catalyst_hunter"),
+            name=merged.get("name", "FinBERT Catalyst Hunter"),
+            persona=merged.get("persona", "AI NLP Catalyst Sniper"),
+            description=merged.get("description", "Pure sentiment intelligence strategy exploiting institutional NLP conviction surges and breaking catalysts."),
+            starting_balance=merged["starting_balance"],
+            max_positions=merged["max_positions"],
+            allocation_pct=merged["allocation_pct"],
+            max_trade_dollars=merged["max_trade_dollars"],
+            stop_loss_pct=merged["stop_loss_pct"],
+            take_profit_pct=merged["take_profit_pct"],
+            params=merged
         )
+        self.min_pos_prob = float(merged.get("min_pos_prob", 0.70))
+        self.min_net_score = float(merged.get("conviction_threshold", merged.get("min_net_score", 0.50)))
+        self.conviction_threshold = self.min_net_score
+        self.exit_net_score = float(merged.get("exit_net_score", -0.40))
 
     def evaluate_entry(self, ticker: str, tech: Dict[str, Any], bert: Dict[str, Any], articles: List[Dict[str, Any]], current_positions: List[str]) -> Tuple[bool, float, str]:
         if not articles:
@@ -973,7 +1187,7 @@ class FinBERTCatalystHunterBot(BotArchetype):
         headline = bert.get("headline", "")
 
         # Triggers on strong positive FinBERT catalyst
-        if pos_prob >= 0.70 or net_score >= 0.50:
+        if pos_prob >= self.min_pos_prob or net_score >= self.min_net_score:
             conviction = round(min(10.0, 5.0 + (pos_prob * 3.5) + (net_score * 1.5)), 1)
             rationale = (
                 f"FinBERT Catalyst BUY (Conviction {conviction}/10). "
@@ -990,7 +1204,7 @@ class FinBERTCatalystHunterBot(BotArchetype):
 
         net_score = bert.get("net_score", 0.0)
         # If catalyst flips negative
-        if net_score <= -0.40:
+        if net_score <= self.exit_net_score:
             return True, f"Catalyst Invalidation: FinBERT sentiment turned bearish ({bert.get('info')})."
         return False, ""
 
@@ -1001,19 +1215,43 @@ class TrendFollowerBot(BotArchetype):
     Enters on confirmed price support above 20-day SMA, non-negative momentum,
     and neutral-to-positive news flow, letting winners run up to +15%.
     """
-    def __init__(self):
+    DEFAULT_PARAMS = {
+        "starting_balance": 5000.00,
+        "max_positions": 6,
+        "allocation_pct": 0.15,
+        "max_trade_dollars": 750.00,
+        "stop_loss_pct": -8.0,
+        "take_profit_pct": 15.0,
+        "min_momentum_5d": 0.0,
+        "min_net_score": 0.0,
+        "sma_breakdown_factor": 0.985,
+        "exit_mom_5d": -2.5
+    }
+
+    def __init__(self, params: Optional[Dict[str, Any]] = None, **kwargs):
+        merged = dict(self.DEFAULT_PARAMS)
+        if params:
+            merged.update(params)
+        if kwargs:
+            merged.update(kwargs)
+
         super().__init__(
-            bot_id="trend_follower",
-            name="Trend Follower",
-            persona="Systematic Trend Follower",
-            description="Systematic trend-following bot riding consistent moving average channels with patient 15% targets.",
-            starting_balance=5000.00,
-            max_positions=6,
-            allocation_pct=0.15,
-            max_trade_dollars=750.00,
-            stop_loss_pct=-8.0,
-            take_profit_pct=15.0
+            bot_id=merged.get("bot_id", "trend_follower"),
+            name=merged.get("name", "Trend Follower"),
+            persona=merged.get("persona", "Systematic Trend Follower"),
+            description=merged.get("description", "Systematic trend-following bot riding consistent moving average channels with patient 15% targets."),
+            starting_balance=merged["starting_balance"],
+            max_positions=merged["max_positions"],
+            allocation_pct=merged["allocation_pct"],
+            max_trade_dollars=merged["max_trade_dollars"],
+            stop_loss_pct=merged["stop_loss_pct"],
+            take_profit_pct=merged["take_profit_pct"],
+            params=merged
         )
+        self.min_momentum_5d = float(merged.get("min_momentum_5d", merged.get("momentum_threshold", 0.0)))
+        self.min_net_score = float(merged.get("min_net_score", 0.0))
+        self.sma_breakdown_factor = float(merged.get("sma_breakdown_factor", 0.985))
+        self.exit_mom_5d = float(merged.get("exit_mom_5d", -2.5))
 
     def evaluate_entry(self, ticker: str, tech: Dict[str, Any], bert: Dict[str, Any], articles: List[Dict[str, Any]], current_positions: List[str]) -> Tuple[bool, float, str]:
         if not tech.get("valid", False):
@@ -1023,7 +1261,7 @@ class TrendFollowerBot(BotArchetype):
         mom_5d = tech.get("momentum_5d", 0.0)
         net_score = bert.get("net_score", 0.0)
 
-        if above_sma and mom_5d >= 0.0 and net_score >= 0.0:
+        if above_sma and mom_5d >= self.min_momentum_5d and net_score >= self.min_net_score:
             conviction = round(min(10.0, 6.0 + (1.5 if above_sma else 0.0) + min(2.0, mom_5d * 0.5)), 1)
             rationale = (
                 f"Trend Follower BUY. Sustained uptrend: ${tech.get('price')} > 20d SMA ${tech.get('sma20')} (5d: +{mom_5d}%). "
@@ -1042,19 +1280,23 @@ class TrendFollowerBot(BotArchetype):
         mom_5d = tech.get("momentum_5d", 0.0)
 
         # Trend break: price drops > 1.5% below 20-day SMA or momentum turns sharply negative
-        if (sma20 > 0 and price < sma20 * 0.985) or mom_5d < -2.5:
+        if (sma20 > 0 and price < sma20 * self.sma_breakdown_factor) or mom_5d < self.exit_mom_5d:
             return True, f"Trend Breakdown: Price lost 20d SMA support (${price} vs SMA ${sma20}, 5d: {mom_5d}%)."
         return False, ""
 
 
-def get_default_tournament_bots() -> List[BotArchetype]:
-    """Returns the official roster of 5 competing tournament bots."""
+def get_default_tournament_bots(params_map: Optional[Dict[str, Dict[str, Any]]] = None) -> List[BotArchetype]:
+    """
+    Returns the official roster of 5 competing tournament bots.
+    If params_map is provided (keyed by bot_id), configured overrides are applied.
+    """
+    pm = params_map or {}
     return [
-        ConservativeSwingBot(),
-        AggressiveBreakoutBot(),
-        ContrarianDipBuyerBot(),
-        FinBERTCatalystHunterBot(),
-        TrendFollowerBot()
+        ConservativeSwingBot(params=pm.get("conservative_swing")),
+        AggressiveBreakoutBot(params=pm.get("aggressive_breakout")),
+        ContrarianDipBuyerBot(params=pm.get("contrarian_dip_buyer")),
+        FinBERTCatalystHunterBot(params=pm.get("finbert_catalyst_hunter")),
+        TrendFollowerBot(params=pm.get("trend_follower"))
     ]
 
 
@@ -1339,7 +1581,12 @@ class MultiBotTournamentEngine:
     5. Computes performance metrics (PnL, Win Rate %, Best Trade).
     6. Displays Live Leaderboard, Borderlist status, and audit records.
     """
-    def __init__(self, bots: Optional[List[BotArchetype]] = None, client: Any = _DEFAULT_CLIENT):
+    def __init__(
+        self,
+        bots: Optional[List[BotArchetype]] = None,
+        client: Any = _DEFAULT_CLIENT,
+        auto_sync_params: bool = True
+    ):
         if client is _DEFAULT_CLIENT:
             try:
                 self.client = get_supabase_client()
@@ -1358,6 +1605,50 @@ class MultiBotTournamentEngine:
         # Initialize funds for all registered bots
         for bot in self.bots.values():
             self.storage.ensure_bot_initialized(bot)
+
+        # Automatically synchronize calibrated parameters from Supabase / local cache
+        if auto_sync_params:
+            self.sync_calibrated_parameters()
+
+    def sync_calibrated_parameters(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Dynamically synchronizes tournament bots with active calibrated parameters from Supabase or local cache.
+
+        Follows 3-Tier Parameter Resolution Architecture:
+        - Tier 1: Supabase Cloud query ('bot_calibrated_parameters' where bot_id=bot_id and active=true)
+        - Tier 2: Local JSON cache ('data/bot_calibrated_parameters.json')
+        - Tier 3: None -> bot retains hardcoded constructor defaults
+
+        Returns:
+            Dict[str, Dict[str, Any]]: Summary mapping of bot_id to its active parameters dictionary.
+        """
+        summary: Dict[str, Dict[str, Any]] = {}
+        for bot_id, bot in self.bots.items():
+            try:
+                calibrated_record = load_calibrated_parameters(self.client, bot_id)
+            except Exception as exc:
+                safe_print(f"[Tournament | {bot.name}] Warning: Parameter sync error ({exc}). Retaining defaults.")
+                calibrated_record = None
+
+            if calibrated_record is not None:
+                # Extract clean parameters dictionary
+                raw_params = calibrated_record.get("parameters")
+                if not isinstance(raw_params, dict) or not raw_params:
+                    excluded_keys = {
+                        "bot_id", "parameters", "metrics", "in_sample_metrics",
+                        "out_of_sample_metrics", "full_metrics", "status", "active",
+                        "updated_at", "calibrated_at"
+                    }
+                    raw_params = {k: v for k, v in calibrated_record.items() if k not in excluded_keys}
+
+                bot.set_params(**raw_params)
+                safe_print(f"✅ [Tournament | {bot.name}] Synced calibrated parameters: {raw_params}")
+            else:
+                safe_print(f"ℹ️ [Tournament | {bot.name}] No calibration found; running with default parameters.")
+
+            summary[bot_id] = bot.get_params()
+
+        return summary
 
     def get_bot_status(self, bot_id: str, snapshot: Optional[MarketSnapshot] = None) -> Dict[str, Any]:
         """Calculates current portfolio equity, positions, P&L, win rate, and best trade for a bot."""

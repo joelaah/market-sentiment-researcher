@@ -156,3 +156,77 @@ values
     ('trend_follower', 5000.00, 5000.00)
 on conflict (bot_id) do nothing;
 
+-- ============================================================================
+-- 3-YEAR HISTORICAL TRAINING & BOT PARAMETER PERSISTENCE (MILESTONE 3)
+-- ============================================================================
+
+-- Table 1: Historical Bot Training & Multi-Bot Arena Backtest Simulation Runs
+create table if not exists public.bot_training_runs (
+    id uuid primary key default gen_random_uuid(),
+    run_id text not null,
+    created_at timestamptz not null default now(),
+    years_trained numeric not null default 3.0,
+    universe_symbols text[] not null default '{}',
+    bot_archetypes text[] not null default '{}',
+    training_metrics jsonb not null default '{}'::jsonb,
+    -- Top-level numeric columns for direct SQL filtering, sorting, and reporting
+    profit_factor numeric default 0.0,
+    win_rate_pct numeric default 0.0,
+    max_drawdown_pct numeric default 0.0,
+    net_return_pct numeric default 0.0,
+    cagr_pct numeric default 0.0,
+    total_trades integer default 0,
+    execution_time_sec numeric default 0.0,
+    in_sample_window jsonb default '{}'::jsonb,
+    out_of_sample_window jsonb default '{}'::jsonb,
+    status text not null default 'success'
+);
+
+-- Indexes for bot_training_runs
+create index if not exists bot_training_runs_run_id_idx on public.bot_training_runs (run_id);
+create index if not exists bot_training_runs_created_at_idx on public.bot_training_runs (created_at desc);
+create index if not exists bot_training_runs_status_idx on public.bot_training_runs (status);
+create index if not exists bot_training_runs_metrics_gin on public.bot_training_runs using gin (training_metrics);
+
+-- Row Level Security (RLS) for bot_training_runs
+alter table public.bot_training_runs enable row level security;
+drop policy if exists "Allow all on bot_training_runs" on public.bot_training_runs;
+create policy "Allow all on bot_training_runs"
+on public.bot_training_runs
+for all
+to anon, authenticated, service_role
+using (true)
+with check (true);
+
+
+-- Table 2: Optimal Bot Calibrated Parameters per Archetype
+create table if not exists public.bot_calibrated_parameters (
+    id uuid primary key default gen_random_uuid(),
+    bot_id text not null,
+    calibrated_at timestamptz not null default now(),
+    parameters jsonb not null default '{}'::jsonb,
+    in_sample_metrics jsonb not null default '{}'::jsonb,
+    out_of_sample_metrics jsonb not null default '{}'::jsonb,
+    full_metrics jsonb not null default '{}'::jsonb,
+    active boolean not null default true,
+    training_run_id text,
+    updated_at timestamptz not null default now(),
+    constraint bot_calibrated_parameters_bot_id_key unique (bot_id)
+);
+
+-- Indexes for bot_calibrated_parameters
+create unique index if not exists bot_calibrated_parameters_bot_id_idx on public.bot_calibrated_parameters (bot_id);
+create index if not exists bot_calibrated_parameters_active_idx on public.bot_calibrated_parameters (bot_id, active);
+create index if not exists bot_calibrated_parameters_calibrated_at_idx on public.bot_calibrated_parameters (calibrated_at desc);
+create index if not exists bot_calibrated_parameters_params_gin on public.bot_calibrated_parameters using gin (parameters);
+
+-- Row Level Security (RLS) for bot_calibrated_parameters
+alter table public.bot_calibrated_parameters enable row level security;
+drop policy if exists "Allow all on bot_calibrated_parameters" on public.bot_calibrated_parameters;
+create policy "Allow all on bot_calibrated_parameters"
+on public.bot_calibrated_parameters
+for all
+to anon, authenticated, service_role
+using (true)
+with check (true);
+

@@ -6,7 +6,18 @@ on:
   schedule:
     # Runs every 4 hours, 7 days a week (including Saturday & Sunday for weekend news catalysts)
     - cron: '0 */4 * * *'
-  workflow_dispatch: # Allows manual trigger from GitHub UI anytime
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Choose action to execute'
+        required: true
+        default: 'tournament'
+        type: choice
+        options:
+          - 'tournament'
+          - 'train_3_years'
+          - 'backtest_report'
+          - 'run_tests'
 
 jobs:
   trade-and-scrape:
@@ -26,7 +37,36 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # OPTION 1: Run Full Test Suite (189 tests)
+      - name: Run Automated Test Suite
+        if: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'run_tests' }}"
+        run: |
+          python -m unittest discover tests
+
+      # OPTION 2: 3-Year Historical Training & Parameter Calibration
+      - name: Run 3-Year Historical Training & Calibrate to Supabase
+        if: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'train_3_years' }}"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EMBEDDING_MODEL_NAME: BAAI/bge-small-en-v1.5
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          python run_pipeline.py --train --years 3
+
+      # OPTION 3: Display Backtest Performance Report
+      - name: Display Historical Backtest Report
+        if: "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'backtest_report' }}"
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python run_pipeline.py --backtest-report
+
+      # DEFAULT (Scheduled, Push, or tournament dispatch): Live News Scraper & Vector Ingestion
       - name: Run News Scraper & Vector Indexing (7 Days a Week)
+        if: "${{ github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'tournament' }}"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -35,6 +75,7 @@ jobs:
           python run_pipeline.py --scrape
 
       - name: Check Relevant NIFTY News & Sentiment Impact
+        if: "${{ github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'tournament' }}"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
@@ -45,6 +86,7 @@ jobs:
           python run_pipeline.py --check-news --symbol NIFTY
 
       - name: Execute Multi-Bot Tournament & Publish Live Leaderboard
+        if: "${{ github.event_name != 'workflow_dispatch' || github.event.inputs.action == 'tournament' }}"
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}

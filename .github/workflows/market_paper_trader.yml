@@ -4,8 +4,8 @@ on:
   push:
     branches: [ main ]
   schedule:
-    # Runs Monday to Friday every 4 hours (00:00, 04:00, 08:00, 12:00, 16:00, 20:00 UTC)
-    - cron: '0 */4 * * 1-5'
+    # Runs every 4 hours, 7 days a week (including Saturday & Sunday for weekend news catalysts)
+    - cron: '0 */4 * * *'
   workflow_dispatch: # Allows manual trigger from GitHub UI anytime
 
 jobs:
@@ -26,13 +26,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run News Scraper & Vector Indexing
+      - name: Run News Scraper & Vector Indexing (7 Days a Week)
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           EMBEDDING_MODEL_NAME: BAAI/bge-small-en-v1.5
         run: |
           python run_pipeline.py --scrape
+
+      - name: Check Relevant NIFTY News & Sentiment Impact
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          EMBEDDING_MODEL_NAME: BAAI/bge-small-en-v1.5
+        run: |
+          python run_pipeline.py --check-news --symbol NIFTY
 
       - name: Execute Multi-Bot Tournament & Publish Live Leaderboard
         env:

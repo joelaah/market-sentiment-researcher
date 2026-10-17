@@ -19,6 +19,7 @@ create table if not exists public.market_news (
 alter table public.market_news enable row level security;
 
 -- Allow read access for authenticated and anonymous users
+drop policy if exists "Allow read access to market news" on public.market_news;
 create policy "Allow read access to market news"
 on public.market_news
 for select
@@ -26,6 +27,7 @@ to authenticated, anon
 using (true);
 
 -- Allow insert/update for backend services, authenticated, and anon scripts
+drop policy if exists "Allow insert and update for market news" on public.market_news;
 create policy "Allow insert and update for market news"
 on public.market_news
 for all

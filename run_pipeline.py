@@ -1,5 +1,15 @@
 import argparse
 import sys
+
+# Ensure UTF-8 / safe character encoding for Windows consoles
+if sys.platform.startswith("win"):
+    try:
+        if sys.stdout and hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        if sys.stderr and hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 from src.config import check_config
 from src.scraper import fetch_financial_news
 from src.embeddings import EmbeddingService
@@ -54,13 +64,12 @@ def run_interactive_research():
         except (KeyboardInterrupt, EOFError):
             break
 
-from src.paper_trader import MultiBotTournamentEngine, PaperTradingEngine
-
 def run_paper_trading():
     missing = check_config()
     if missing:
         print(f"[Error] Missing Supabase configuration in .env: {', '.join(missing)}")
         sys.exit(1)
+    from src.paper_trader import MultiBotTournamentEngine
     engine = MultiBotTournamentEngine()
     engine.evaluate_tournament()
     engine.print_leaderboard()
@@ -70,6 +79,7 @@ def run_portfolio_view(bot_id: str = None):
     if missing:
         print(f"[Error] Missing Supabase configuration in .env: {', '.join(missing)}")
         sys.exit(1)
+    from src.paper_trader import MultiBotTournamentEngine
     engine = MultiBotTournamentEngine()
     engine.print_leaderboard()
 
@@ -78,6 +88,7 @@ def run_borderlist_view():
     if missing:
         print(f"[Error] Missing Supabase configuration in .env: {', '.join(missing)}")
         sys.exit(1)
+    from src.paper_trader import MultiBotTournamentEngine
     engine = MultiBotTournamentEngine()
     engine.print_borderlist()
 
@@ -91,10 +102,43 @@ def main():
     parser.add_argument("--bot", type=str, default=None, help="Specific bot ID to inspect (optional)")
     parser.add_argument("--check-news", action="store_true", help="Automated news relevance checker for NIFTY / Indian markets")
     parser.add_argument("--symbol", type=str, default="NIFTY", help="Target market symbol for relevance check (default: NIFTY)")
+    parser.add_argument("--test-telegram", action="store_true", help="Send a test trade & NIFTY alert to verify Telegram integration")
     
     args = parser.parse_args()
 
-    if args.check_news:
+    if args.test_telegram:
+        from src.telegram_notifier import is_telegram_configured, send_telegram_message, notify_trade, notify_nifty_catalyst
+        print("\n--- Testing Telegram Integration ---")
+        if not is_telegram_configured():
+            print("❌ Telegram credentials missing or set to defaults in .env.")
+            print("Please set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env")
+            sys.exit(1)
+        print("Sending test greeting, trade alert, and NIFTY catalyst alert...")
+        s1 = send_telegram_message("🚀 <b>Market Sentiment Researcher: Telegram Alerts Online!</b>\nConnected to DeepMind Antigravity Multi-Bot Arena.")
+        s2 = notify_trade(
+            bot_name="FinBERT Catalyst Hunter",
+            action="BUY",
+            symbol="NIFTYBEES.NS",
+            shares=3.7893,
+            price=263.90,
+            total_val=1000.00,
+            rationale="Test alert: Nifty soars 2.8% on strong macroeconomic catalyst"
+        )
+        s3 = notify_nifty_catalyst(
+            title="Nifty 50 approaches record highs as FII inflows surge",
+            source="Economic Times Markets",
+            polarity="positive",
+            confidence=0.92,
+            materiality="HIGH",
+            relevance_score=1.45,
+            link="https://economictimes.indiatimes.com"
+        )
+        if s1 and s2 and s3:
+            print("✅ All test alerts successfully delivered to Telegram!")
+        else:
+            print("⚠️ Some alerts could not be delivered. Check bot permissions or chat ID.")
+        sys.exit(0)
+    elif args.check_news:
         from src.relevance import run_news_relevance_check
         run_news_relevance_check(symbol=args.symbol)
         sys.exit(0)

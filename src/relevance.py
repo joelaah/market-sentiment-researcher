@@ -700,4 +700,29 @@ def run_news_relevance_check(
         total_analyzed=total_scanned
     )
     print("\n" + brief_text)
+
+    # Optional Telegram Alert for High-Materiality Catalysts
+    try:
+        from src.telegram_notifier import notify_nifty_catalyst, is_telegram_configured
+        if is_telegram_configured():
+            sent_count = 0
+            for item in relevant_results:
+                if item.get("materiality", "").upper() == "HIGH" and sent_count < 3:
+                    art = item.get("article", {})
+                    sent = item.get("sentiment", {})
+                    notify_nifty_catalyst(
+                        title=art.get("title", ""),
+                        source=art.get("source", "Market News"),
+                        polarity=sent.get("polarity", "neutral"),
+                        confidence=sent.get("confidence", 0.8),
+                        materiality=item.get("materiality", "HIGH"),
+                        relevance_score=item.get("relevance_score", 1.0),
+                        link=art.get("link", "")
+                    )
+                    sent_count += 1
+            if sent_count > 0:
+                print(f"[Telegram] Dispatched {sent_count} high-impact NIFTY catalyst alert(s) to Telegram.")
+    except Exception:
+        pass
+
     return relevant_results

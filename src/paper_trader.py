@@ -67,6 +67,7 @@ def safe_print(*args, **kwargs):
 
 from src.db import get_supabase_client
 from src.finbert_analyzer import FinBERTAnalyzer
+from src.telegram_notifier import notify_trade
 
 # Sentinel for default client initialization
 _DEFAULT_CLIENT = object()
@@ -1548,6 +1549,20 @@ class MultiBotTournamentEngine:
 
         safe_print(f"✅ [PAPER BUY] [{bot.name}] {shares:.4f} shares of {symbol} @ ${price:.2f} (${actual_cost:.2f})")
         safe_print(f"   ↳ Rationale: {rationale}")
+
+        try:
+            notify_trade(
+                bot_name=bot.name,
+                action="BUY",
+                symbol=symbol,
+                shares=shares,
+                price=price,
+                total_val=actual_cost,
+                rationale=rationale
+            )
+        except Exception:
+            pass
+
         return True
 
     def execute_sell(self, bot_id: str, symbol: str, shares: float, rationale: str, current_price: Optional[float] = None) -> bool:
@@ -1597,6 +1612,21 @@ class MultiBotTournamentEngine:
         pnl_str = f"{'+' if pnl >= 0 else ''}${pnl:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%)"
         safe_print(f"🔴 [PAPER SELL] [{bot.name}] {shares_to_sell:.4f} shares of {symbol} @ ${price:.2f} (${gross_proceeds:.2f}) | PnL: {pnl_str}")
         safe_print(f"   ↳ Rationale: {rationale}")
+
+        try:
+            notify_trade(
+                bot_name=bot.name,
+                action="SELL",
+                symbol=symbol,
+                shares=shares_to_sell,
+                price=price,
+                total_val=gross_proceeds,
+                rationale=rationale,
+                pnl_str=pnl_str
+            )
+        except Exception:
+            pass
+
         return True
 
     def get_borderlist(self) -> Dict[str, Dict[str, Any]]:

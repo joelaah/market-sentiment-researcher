@@ -71,12 +71,30 @@ from src.finbert_analyzer import FinBERTAnalyzer
 # Sentinel for default client initialization
 _DEFAULT_CLIENT = object()
 
-# Tickers monitored across all tournament bots (Mega-Caps + High-Potential Small/Mid-Caps)
+# Tickers monitored across all tournament bots (Mega-Caps + High-Potential Small/Mid-Caps + Indian Market Benchmark & ETF)
 DEFAULT_WATCHLIST = [
     "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AMD", "SPY", "QQQ",
-    "PLTR", "SOFI", "IONQ", "ASTS", "RKLB", "SMCI", "COIN", "HOOD"
+    "PLTR", "SOFI", "IONQ", "ASTS", "RKLB", "SMCI", "COIN", "HOOD",
+    "^NSEI", "NIFTYBEES.NS"
 ]
 WATCHLIST = DEFAULT_WATCHLIST
+
+# Benchmark indices tracked for macroeconomic / market sentiment analysis (non-tradeable spot assets)
+BENCHMARK_INDICES = {"^NSEI", "^GSPC", "^IXIC", "^DJI"}
+
+# Tradeable tracking instruments / ETFs mapped from indices
+INDEX_TRADEABLE_MAP = {
+    "^NSEI": "NIFTYBEES.NS",
+}
+
+def is_benchmark_index(symbol: str) -> bool:
+    """Determines if a symbol is a non-tradeable benchmark index (e.g. ^NSEI)."""
+    return symbol.startswith("^") or symbol.upper() in BENCHMARK_INDICES
+
+def is_inr_symbol(symbol: str) -> bool:
+    """Determines whether an instrument belongs to the Indian market currency regime (INR)."""
+    sym = symbol.upper()
+    return sym.endswith((".NS", ".BO")) or sym == "^NSEI"
 
 # Sentiment keyword fallback signals
 BULLISH_SIGNALS = [
@@ -96,9 +114,20 @@ CATALYST_KEYWORDS = [
 ]
 
 # Safety Border / Guardrail Filter Constants
-MIN_SHARE_PRICE = 5.00
+MIN_SHARE_PRICE = 5.00          # USD minimum floor
+MIN_SHARE_PRICE_INR = 20.00     # INR minimum floor for Indian equities/ETFs
 MIN_DAILY_VOLUME = 200_000.0
 MIN_MARKET_CAP = 250_000_000.0  # $250M
+
+# Trusted mega-caps, benchmark indices, and premier ETFs exempt from off-hours liquidity disqualification
+TRUSTED_SYMBOLS = {
+    "NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AMD", "SPY", "QQQ",
+    "^NSEI", "NIFTYBEES.NS"
+}
+
+def get_min_price_for_symbol(symbol: str) -> float:
+    """Returns currency-aware minimum price floor ($5.00 USD vs ₹20.00 INR)."""
+    return MIN_SHARE_PRICE_INR if is_inr_symbol(symbol) else MIN_SHARE_PRICE
 
 # Local fallback storage directory
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
@@ -124,9 +153,11 @@ class BorderlistGuardrail:
         self,
         min_price: float = MIN_SHARE_PRICE,
         min_volume: float = MIN_DAILY_VOLUME,
-        min_market_cap: float = MIN_MARKET_CAP
+        min_market_cap: float = MIN_MARKET_CAP,
+        min_price_inr: float = MIN_SHARE_PRICE_INR
     ):
         self.min_price = min_price
+        self.min_price_inr = min_price_inr
         self.min_volume = min_volume
         self.min_market_cap = min_market_cap
         self.disqualified: Dict[str, Dict[str, Any]] = {}
@@ -136,7 +167,8 @@ class BorderlistGuardrail:
         symbol: str,
         price: Optional[float],
         volume: Optional[float] = None,
-        market_cap: Optional[float] = None
+        market_cap: Optional[float] = None,
+        currency: Optional[str] = None
     ) -> Tuple[bool, Optional[str]]:
         """
         Evaluates whether a ticker passes safety guardrails.
@@ -151,9 +183,17 @@ class BorderlistGuardrail:
         if market_cap is not None and (market_cap != market_cap or market_cap < 0):
             market_cap = None
 
-        # 1. Share price floor ($5.00)
-        if price < self.min_price:
-            return False, f"Share price ${price:.2f} is below minimum floor of ${self.min_price:.2f} (penny stock risk)"
+        sym_upper = symbol.upper()
+        is_inr = (
+            (currency is not None and currency.upper() == "INR")
+            or is_inr_symbol(sym_upper)
+        )
+        min_floor = self.min_price_inr if is_inr else self.min_price
+        curr_label = "₹" if is_inr else "$"
+
+        # 1. Share price floor ($5.00 for US, ₹20.00 for Indian market)
+        if price < min_floor:
+            return False, f"Share price {curr_label}{price:.2f} is below minimum floor of {curr_label}{min_floor:.2f} (penny stock risk)"
 
         # 2. Minimum liquidity / market cap requirement:
         # Require legitimate trading volume (>= 200,000) OR market cap >= $250M
@@ -162,13 +202,16 @@ class BorderlistGuardrail:
 
         # If neither volume nor market cap data is provided or verifiable:
         if volume is None and market_cap is None:
-            # Trusted mega-caps/index ETFs known to possess billions in liquidity
-            if symbol.upper() in {"NVDA", "AAPL", "MSFT", "GOOGL", "AMZN", "META", "TSLA", "AMD", "SPY", "QQQ"}:
+            # Trusted mega-caps, benchmark indices, and premier ETFs known to possess billions in liquidity
+            if sym_upper in TRUSTED_SYMBOLS:
                 return True, None
             return False, "Unverified liquidity and market cap (both volume and market cap are missing/unavailable)"
 
         # If liquidity data is provided, require volume >= 200,000 OR market cap >= $250M
         if not (has_volume or has_market_cap):
+            # Trusted mega-caps, benchmark indices, and premier ETFs are exempt from illiquid micro-cap risk during off-hours
+            if sym_upper in TRUSTED_SYMBOLS:
+                return True, None
             vol_str = f"{int(volume):,}" if volume is not None else "Unknown"
             cap_str = f"${market_cap/1e6:.1f}M" if market_cap is not None else "Unknown"
             return False, (
@@ -328,33 +371,51 @@ def extract_candidate_tickers_from_articles(articles: List[Dict[str, Any]]) -> L
         "alphabet": "GOOGL", "amazon": "AMZN", "meta": "META", "tesla": "TSLA",
         "amd": "AMD", "palantir": "PLTR", "sofi": "SOFI", "ionq": "IONQ",
         "ast spacemobile": "ASTS", "rocket lab": "RKLB", "super micro": "SMCI",
-        "coinbase": "COIN", "robinhood": "HOOD", "crowdstrike": "CRWD", "marathon digital": "MARA"
+        "coinbase": "COIN", "robinhood": "HOOD", "crowdstrike": "CRWD", "marathon digital": "MARA",
+        # Indian market aliases and benchmark mappings
+        "nifty": ["^NSEI", "NIFTYBEES.NS"],
+        "nifty 50": ["^NSEI", "NIFTYBEES.NS"],
+        "nifty fifty": ["^NSEI", "NIFTYBEES.NS"],
+        "nse nifty": ["^NSEI", "NIFTYBEES.NS"],
+        "sensex": ["^NSEI", "NIFTYBEES.NS"],
+        "niftybees": ["NIFTYBEES.NS", "^NSEI"],
+        "nifty bees": ["NIFTYBEES.NS", "^NSEI"],
     }
     IGNORED_WORDS = {
         "CEO", "CFO", "CTO", "USA", "USD", "GDP", "FED", "SEC", "IPO", "ETF",
         "CPI", "AI", "API", "WSJ", "CNBC", "DJIA", "NYSE", "NASDAQ", "SPY", "QQQ",
         "US", "UK", "EU", "EST", "EDT", "PST", "UTC", "GMT", "AM", "PM", "NEW",
         "OLD", "NOW", "ALL", "TOP", "BIG", "OUT", "FOR", "AND", "THE", "NOT",
-        "YES", "NO", "MORE", "FREE", "POST", "PRE", "EDIT", "LIVE", "UPDATE"
+        "YES", "NO", "MORE", "FREE", "POST", "PRE", "EDIT", "LIVE", "UPDATE",
+        "INR", "RBI", "NSE", "BSE"
     }
     found = set()
     for art in articles:
         text = f"{art.get('title', '')} {art.get('summary', '')}"
-        # Dollar tags like $PLTR, $SOFI
-        for m in re.finditer(r'\$([A-Za-z]{1,5})\b', text):
+        # Dollar tags like $PLTR, $SOFI, $NIFTYBEES.NS (up to 15 chars, optional .NS/.BO)
+        for m in re.finditer(r'\$([A-Za-z0-9^]{1,15}(?:\.[A-Za-z]{2,4})?)\b', text):
             sym = m.group(1).upper()
             if sym not in IGNORED_WORDS:
                 found.add(sym)
-        # Parenthetical tickers like (PLTR)
-        for m in re.finditer(r'\(([A-Za-z]{2,5})\)', text):
+        # Parenthetical tickers like (PLTR), (NIFTYBEES.NS) (up to 15 chars)
+        for m in re.finditer(r'\(([A-Za-z0-9^]{2,15}(?:\.[A-Za-z]{2,4})?)\)', text):
             sym = m.group(1).upper()
             if sym not in IGNORED_WORDS:
                 found.add(sym)
-        # Company name mentions
+        # Direct Indian exchange tickers like NIFTYBEES.NS, RELIANCE.NS
+        for m in re.finditer(r'\b([A-Za-z0-9]{1,15}\.(?:NS|BO))\b', text, re.IGNORECASE):
+            sym = m.group(1).upper()
+            if sym not in IGNORED_WORDS:
+                found.add(sym)
+        # Company name and market keyword mentions
         text_lower = text.lower()
-        for company, sym in KNOWN_MAP.items():
-            if re.search(r'\b' + re.escape(company) + r'\b', text_lower):
-                found.add(sym)
+        for keyword, syms in KNOWN_MAP.items():
+            if re.search(r'\b' + re.escape(keyword) + r'\b', text_lower):
+                if isinstance(syms, list):
+                    for s in syms:
+                        found.add(s)
+                else:
+                    found.add(syms)
     return list(found)
 
 
@@ -394,7 +455,8 @@ def get_stock_market_metrics(symbol: str) -> Dict[str, Any]:
         "market_cap": None,
         "sma20": 0.0,
         "above_sma20": False,
-        "momentum_5d": 0.0
+        "momentum_5d": 0.0,
+        "currency": "INR" if is_inr_symbol(symbol) else "USD"
     }
     try:
         t = yf.Ticker(symbol)
@@ -409,6 +471,9 @@ def get_stock_market_metrics(symbol: str) -> Dict[str, Any]:
             mc = getattr(fast_info, "market_cap", None)
             if mc and not (isinstance(mc, float) and (mc != mc)):
                 res["market_cap"] = float(mc)
+            curr = getattr(fast_info, "currency", None)
+            if curr:
+                res["currency"] = str(curr).upper()
 
         hist = t.history(period="1mo")
         if not hist.empty and "Close" in hist:
@@ -479,12 +544,14 @@ class MarketSnapshot:
         """
         Returns candidate tickers that passed border guardrails,
         ranked by probability-weighted expected return descending.
+        Excludes non-tradeable benchmark tracking indices (e.g. ^NSEI).
         """
         qualified = [
             t for t in self.prices
             if t in self.upside_metrics
             and t not in self.borderlist
-            and self.prices.get(t, 0.0) >= MIN_SHARE_PRICE
+            and not is_benchmark_index(t)
+            and self.prices.get(t, 0.0) >= get_min_price_for_symbol(t)
         ]
         qualified.sort(
             key=lambda t: (
@@ -519,11 +586,44 @@ class MarketSnapshot:
             if nt not in base_candidates:
                 base_candidates.append(nt)
 
+        TICKER_ALIAS_MAP = {
+            "^NSEI": ["^nsei", "nifty", "nifty 50", "nifty fifty", "nse nifty", "sensex"],
+            "NIFTYBEES.NS": ["niftybees.ns", "niftybees", "nifty bees", "nifty", "nifty 50"],
+            "NVDA": ["nvda", "nvidia"],
+            "AAPL": ["aapl", "apple"],
+            "MSFT": ["msft", "microsoft"],
+            "GOOGL": ["googl", "google", "alphabet"],
+            "AMZN": ["amzn", "amazon"],
+            "META": ["meta", "facebook"],
+            "TSLA": ["tsla", "tesla"],
+            "AMD": ["amd"],
+            "SPY": ["spy", "s&p 500", "s&p500"],
+            "QQQ": ["qqq", "nasdaq 100"],
+            "PLTR": ["pltr", "palantir"],
+            "SOFI": ["sofi"],
+            "IONQ": ["ionq"],
+            "ASTS": ["asts", "ast spacemobile"],
+            "RKLB": ["rklb", "rocket lab"],
+            "SMCI": ["smci", "super micro"],
+            "COIN": ["coin", "coinbase"],
+            "HOOD": ["hood", "robinhood"],
+        }
+
         ticker_articles: Dict[str, List[Dict[str, Any]]] = {t: [] for t in base_candidates}
         for art in articles:
             combined = f"{art.get('title', '')} {art.get('summary', '')}".lower()
             for ticker in base_candidates:
-                if re.search(r'\b' + re.escape(ticker.lower()) + r'\b', combined):
+                terms = TICKER_ALIAS_MAP.get(ticker.upper(), [ticker.lower()])
+                if ticker.lower() not in terms:
+                    terms = [ticker.lower()] + list(terms)
+                matched = False
+                for term in terms:
+                    sb = r'\b' if term[0].isalnum() else r'(?<!\w)'
+                    eb = r'\b' if term[-1].isalnum() else r'(?!\w)'
+                    if re.search(sb + re.escape(term) + eb, combined, re.IGNORECASE):
+                        matched = True
+                        break
+                if matched:
                     ticker_articles[ticker].append(art)
 
         prices: Dict[str, float] = {}
@@ -601,7 +701,7 @@ class MarketSnapshot:
             # 3. Safety Border Guardrail Evaluation
             net_sentiment = finbert_scores[ticker].get("net_score", 0.0)
             is_hot = (net_sentiment > 0.20 or bullish_count > 0 or metrics.get("momentum_5d", 0.0) > 1.5)
-            is_safe, reject_reason = border_filter.evaluate(ticker, price, vol, mcap)
+            is_safe, reject_reason = border_filter.evaluate(ticker, price, vol, mcap, currency=metrics.get("currency"))
 
             if not is_safe:
                 border_filter.disqualify(ticker, price, vol, mcap, reject_reason, is_hot=is_hot)
@@ -1369,7 +1469,22 @@ class MultiBotTournamentEngine:
     ) -> bool:
         """Simulates buying stock for a specific bot's independent fund with border guardrail verification."""
         bot = self.bots[bot_id]
-        price = current_price or get_current_price(symbol)
+
+        # Route benchmark indices to their tradeable tracking ETFs
+        if is_benchmark_index(symbol):
+            if symbol in INDEX_TRADEABLE_MAP:
+                tradeable_target = INDEX_TRADEABLE_MAP[symbol]
+                safe_print(f"[Tournament | {bot.name}] Routing benchmark index {symbol} buy order to tradeable ETF {tradeable_target}")
+                symbol = tradeable_target
+                current_price = None  # Reset caller-provided index price so ETF market price is fetched
+                price = get_current_price(symbol)
+                volume = None
+                market_cap = None
+            else:
+                safe_print(f"[Tournament | {bot.name}] Cannot buy {symbol}: benchmark index is non-tradeable")
+                return False
+
+        price = current_price or (price if 'price' in locals() and price else None) or get_current_price(symbol)
         if not price or price <= 0:
             safe_print(f"[Tournament | {bot.name}] Cannot buy {symbol}: invalid price {price}")
             return False
@@ -1582,7 +1697,8 @@ class MultiBotTournamentEngine:
 
             # 2. Evaluate Entry Candidates in ranked order of probability-weighted upside
             for ticker in ranked_candidates:
-                if len(refreshed_status["positions"]) >= bot.max_positions and ticker not in open_symbols:
+                tradeable_target = INDEX_TRADEABLE_MAP.get(ticker, ticker)
+                if len(refreshed_status["positions"]) >= bot.max_positions and ticker not in open_symbols and tradeable_target not in open_symbols:
                     continue  # Position limit reached for this bot
 
                 tech = snapshot.technicals.get(ticker, {"valid": False})
@@ -1597,7 +1713,7 @@ class MultiBotTournamentEngine:
                     ticker, tech, bert, articles, open_symbols
                 )
 
-                if should_enter and ticker not in open_symbols:
+                if should_enter and ticker not in open_symbols and tradeable_target not in open_symbols:
                     # Enrich rationale with probability-weighted upside metrics
                     metrics = snapshot.upside_metrics.get(ticker, {})
                     upside_str = f" [Upside Prob: {metrics.get('upside_probability_pct', 0)}%, Exp Return: +{metrics.get('expected_return_pct', 0)}%, Tier: {metrics.get('cap_tier', 'N/A')}]"
@@ -1617,6 +1733,7 @@ class MultiBotTournamentEngine:
                         # Re-update status so we don't exceed cash on subsequent candidate
                         refreshed_status = self.get_bot_status(bot_id, snapshot)
                         open_symbols.append(ticker)
+                        open_symbols.append(tradeable_target)
 
         safe_print("\n" + "=" * 90)
         safe_print("          ✅ MULTI-BOT TOURNAMENT EVALUATION COMPLETE           ")

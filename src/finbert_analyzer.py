@@ -22,16 +22,25 @@ class FinBERTAnalyzer:
             self.model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
             self.model.eval()
 
-    def analyze(self, text: str) -> Dict[str, float]:
+    def analyze(self, text: str) -> Dict[str, Any]:
         """
-        Analyzes financial text and returns pure probabilities:
+        Analyzes financial text and returns pure probabilities and classification:
         - positive: 0.0 to 1.0
         - negative: 0.0 to 1.0
         - neutral: 0.0 to 1.0
         - net_score: positive - negative (bounded strictly between -1.0 and +1.0)
+        - polarity: string argmax class ("positive", "negative", or "neutral")
+        - confidence: float highest class probability score (rounded to 4 decimal places)
         """
         if not text or not text.strip():
-            return {"positive": 0.0, "negative": 0.0, "neutral": 1.0, "net_score": 0.0}
+            return {
+                "positive": 0.0,
+                "negative": 0.0,
+                "neutral": 1.0,
+                "net_score": 0.0,
+                "polarity": "neutral",
+                "confidence": 1.0
+            }
 
         self._load_model()
         
@@ -57,13 +66,19 @@ class FinBERTAnalyzer:
         neu = probs_dict.get("neutral", 0.0)
         net_score = round(pos - neg, 4)
 
+        scores = {"positive": pos, "negative": neg, "neutral": neu}
+        polarity = max(scores, key=scores.get)
+        confidence = round(float(scores[polarity]), 4)
+
         return {
             "positive": pos,
             "negative": neg,
             "neutral": neu,
-            "net_score": net_score
+            "net_score": net_score,
+            "polarity": polarity,
+            "confidence": confidence
         }
 
-    def batch_analyze(self, texts: List[str]) -> List[Dict[str, float]]:
+    def batch_analyze(self, texts: List[str]) -> List[Dict[str, Any]]:
         """Batch analyzes multiple articles."""
         return [self.analyze(t) for t in texts]

@@ -89,10 +89,16 @@ def main():
     parser.add_argument("--portfolio", "--leaderboard", dest="portfolio", action="store_true", help="View Live Multi-Bot Tournament Leaderboard")
     parser.add_argument("--borderlist", action="store_true", help="View Safety Borderlist & Guardrails status (disqualified tickers)")
     parser.add_argument("--bot", type=str, default=None, help="Specific bot ID to inspect (optional)")
+    parser.add_argument("--check-news", action="store_true", help="Automated news relevance checker for NIFTY / Indian markets")
+    parser.add_argument("--symbol", type=str, default="NIFTY", help="Target market symbol for relevance check (default: NIFTY)")
     
     args = parser.parse_args()
 
-    if args.scrape:
+    if args.check_news:
+        from src.relevance import run_news_relevance_check
+        run_news_relevance_check(symbol=args.symbol)
+        sys.exit(0)
+    elif args.scrape:
         run_scraper_and_indexing()
     elif args.trade:
         run_paper_trading()
@@ -118,8 +124,9 @@ def main():
         print("3. Run Multi-Bot Tournament evaluation & paper trading")
         print("4. View Live Multi-Bot Tournament Leaderboard")
         print("5. View Safety Borderlist & Guardrails status")
-        print("6. Exit")
-        choice = input("Select an option (1-6): ").strip()
+        print("6. Run Targeted News Relevance Checker (NIFTY)")
+        print("7. Exit")
+        choice = input("Select an option (1-7): ").strip()
 
         if choice == "1":
             run_scraper_and_indexing()
@@ -131,6 +138,9 @@ def main():
             run_portfolio_view()
         elif choice == "5":
             run_borderlist_view()
+        elif choice == "6":
+            from src.relevance import run_news_relevance_check
+            run_news_relevance_check(symbol="NIFTY")
         else:
             print("Exiting.")
 

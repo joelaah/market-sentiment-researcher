@@ -23,3 +23,6 @@ env/
 # Local tournament cache
 data/
 *.json.bak
+
+# Agent workspaces
+.agents/

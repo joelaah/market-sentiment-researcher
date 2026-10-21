@@ -10,6 +10,8 @@ import os
 import sys
 import json
 import re
+import logging
+import warnings
 import uuid
 import pandas as pd
 import numpy as np
@@ -650,6 +652,11 @@ class HistoricalBacktestEngine:
         # Keep track of last known prices across holidays
         latest_known_prices: Dict[str, float] = {}
 
+        # Track whether any bar used synthetic (price-derived) sentiment
+        _backtest_logger = logging.getLogger("BacktestEngine")
+        used_synthetic_sentiment = False
+        _synthetic_warned = False
+
         # 4. Chronological Bar-by-Bar Stepping
         for bar_idx, current_date in enumerate(master_dates):
             date_str = str(current_date)[:10]
@@ -707,13 +714,52 @@ class HistoricalBacktestEngine:
 
                     # Sentiment construction
                     # If external sentiment feed has an entry for (date_str, sym)
-                    feed_key = f"{date_str}_{sym}"
-                    if sentiment_feed and feed_key in sentiment_feed:
-                        bert_entry = sentiment_feed[feed_key]
-                        bar_finbert[sym] = bert_entry.get("bert", {})
-                        bar_articles[sym] = bert_entry.get("articles", [])
+                    feed_entry = None
+                    if sentiment_feed:
+                        feed_key = f"{date_str}_{sym}"
+                        if feed_key in sentiment_feed:
+                            feed_entry = sentiment_feed[feed_key]
+                        elif (date_str, sym) in sentiment_feed:
+                            feed_entry = sentiment_feed[(date_str, sym)]
+                        elif date_str in sentiment_feed and isinstance(sentiment_feed[date_str], dict) and sym in sentiment_feed[date_str]:
+                            feed_entry = sentiment_feed[date_str][sym]
+                        elif sym in sentiment_feed and isinstance(sentiment_feed[sym], dict) and date_str in sentiment_feed[sym]:
+                            feed_entry = sentiment_feed[sym][date_str]
+
+                    if feed_entry is not None:
+                        if isinstance(feed_entry, dict) and "bert" in feed_entry:
+                            bar_finbert[sym] = feed_entry.get("bert", {})
+                            bar_articles[sym] = feed_entry.get("articles", [])
+                        elif isinstance(feed_entry, dict):
+                            bar_finbert[sym] = feed_entry
+                            bar_articles[sym] = feed_entry.get("articles", [])
+                        else:
+                            bar_finbert[sym] = {}
+                            bar_articles[sym] = []
                     else:
-                        # Regime-Conditioned Catalyst Proxy:
+                        # WARNING: Regime-Conditioned Catalyst Proxy (SYNTHETIC).
+                        # This generates mock sentiment directly from price moves and
+                        # volume surges, creating CIRCULAR LOGIC — sentiment is derived
+                        # from the very price data the strategy trades on. Results
+                        # using synthetic sentiment are UNRELIABLE for live deployment
+                        # validation. Supply a real sentiment_feed dict to get
+                        # meaningful backtest results.
+                        if not _synthetic_warned:
+                            warnings.warn(
+                                "Backtest is using SYNTHETIC sentiment derived from price data. "
+                                "This creates circular logic and results are unreliable. "
+                                "Provide a real sentiment_feed with historical news/FinBERT "
+                                "scores for trustworthy backtest results.",
+                                UserWarning,
+                                stacklevel=2
+                            )
+                            _backtest_logger.warning(
+                                "Synthetic price-derived sentiment active — backtest results "
+                                "should NOT be used for live trading validation."
+                            )
+                            _synthetic_warned = True
+                        used_synthetic_sentiment = True
+
                         # Check price delta and volume surge relative to adv20
                         adv = tech_series[sym]["adv20"].loc[current_date] if tech_series[sym]["adv20"] is not None else None
                         if isinstance(adv, pd.Series):
@@ -733,7 +779,7 @@ class HistoricalBacktestEngine:
                             articles_list = [{
                                 "title": headline,
                                 "summary": f"{sym} demonstrates strong volume and upward momentum.",
-                                "source": "Market Replay"
+                                "source": "Synthetic-Market-Replay"
                             }]
                         elif daily_ret <= -0.025 or mom5d_val <= -4.0:
                             pos_prob = 0.08
@@ -744,7 +790,7 @@ class HistoricalBacktestEngine:
                             articles_list = [{
                                 "title": headline,
                                 "summary": f"{sym} experiences sharp selling pressure.",
-                                "source": "Market Replay"
+                                "source": "Synthetic-Market-Replay"
                             }]
                         else:
                             pos_prob = 0.33
@@ -755,7 +801,7 @@ class HistoricalBacktestEngine:
                             articles_list = [{
                                 "title": headline,
                                 "summary": f"{sym} trades in range.",
-                                "source": "Market Replay"
+                                "source": "Synthetic-Market-Replay"
                             }]
 
                         bar_finbert[sym] = {
@@ -765,7 +811,8 @@ class HistoricalBacktestEngine:
                             "negative": neg_prob,
                             "neutral": 1.0 - (pos_prob + neg_prob),
                             "info": f"FinBERT[Pos={pos_prob:.2f}, Neg={neg_prob:.2f}, Net={net_sc:.2f}]",
-                            "headline": headline
+                            "headline": headline,
+                            "synthetic": True
                         }
                         bar_articles[sym] = articles_list
 
@@ -1013,8 +1060,19 @@ class HistoricalBacktestEngine:
         results: Dict[str, Any] = {
             "calendar_dates": [str(d)[:10] for d in master_dates],
             "total_bars": len(master_dates),
+            "used_synthetic_sentiment": used_synthetic_sentiment,
+            "synthetic_sentiment_used": used_synthetic_sentiment,
+            "sentiment_source": "synthetic-price-derived" if used_synthetic_sentiment else "real-news-feed",
             "bots": {}
         }
+
+        if used_synthetic_sentiment:
+            results["sentiment_warning"] = (
+                "CAUTION: This backtest used synthetic sentiment derived from price data. "
+                "Sentiment signals are circularly constructed from the same price/volume "
+                "data the strategies trade on. These results should NOT be used for live "
+                "deployment validation. Re-run with a real sentiment_feed for reliable results."
+            )
 
         for b in bot_list:
             port = portfolios[b.bot_id]
@@ -1027,6 +1085,8 @@ class HistoricalBacktestEngine:
                 initial_balance=self.initial_balance,
                 years=duration_years
             )
+            metrics["synthetic_sentiment_used"] = used_synthetic_sentiment
+            metrics["used_synthetic_sentiment"] = used_synthetic_sentiment
 
             bot_summary = {
                 "bot_id": b.bot_id,

@@ -213,7 +213,10 @@ def load_all_calibrated_metrics(client: Optional[Any] = None) -> Tuple[Dict[str,
     return {}, "None (No calibration records found)"
 
 
-def run_backtest_report(client: Optional[Any] = None, cached_data: Optional[Dict[str, Any]] = None) -> bool:
+_DEFAULT_CLIENT = object()
+
+
+def run_backtest_report(client: Optional[Any] = _DEFAULT_CLIENT, cached_data: Optional[Dict[str, Any]] = None) -> bool:
     """
     Renders an aligned comparative tabular summary comparing all 5 bots across:
     Bot Persona | Win Rate % | Profit Factor | Max Drawdown % | Net Return % | Total Trades | Status | Key Calibrated Params
@@ -226,7 +229,7 @@ def run_backtest_report(client: Optional[Any] = None, cached_data: Optional[Dict
         profiles = cached_data
         source_desc = "Current Training Pipeline Execution"
     else:
-        if client is None:
+        if client is _DEFAULT_CLIENT:
             try:
                 from src.db import get_supabase_client
                 client = get_supabase_client()
@@ -256,7 +259,27 @@ def run_backtest_report(client: Optional[Any] = None, cached_data: Optional[Dict
 
         params = entry.get("parameters") or entry.get("best_params") or {}
         metrics = entry.get("full_period_metrics") or entry.get("full_metrics") or entry.get("metrics") or {}
-        status = str(entry.get("status", "active" if entry else "not calibrated"))
+        status = entry.get("status")
+        if not status or status == "active":
+            oos = entry.get("out_of_sample_metrics") or {}
+            oos_ret = float(oos.get("net_return_pct", 0.0))
+            oos_pf = float(oos.get("profit_factor", 0.0))
+            if oos and (oos_ret != 0.0 or oos_pf != 0.0):
+                try:
+                    from src.calibration import check_overfitting_gate
+                    is_m = entry.get("in_sample_metrics") or {}
+                    is_overfit, _ = check_overfitting_gate(is_m, oos)
+                    status = "degraded" if is_overfit else "optimal"
+                except Exception:
+                    is_m = entry.get("in_sample_metrics") or {}
+                    is_ret = float(is_m.get("net_return_pct", 0.0))
+                    if oos_ret <= 0.0 or oos_pf < 1.0 or (is_ret > 5.0 and oos_ret < 0.25 * is_ret):
+                        status = "degraded"
+                    else:
+                        status = "optimal"
+            elif not status:
+                status = "active" if entry else "not calibrated"
+        status = str(status)
 
         win_rate = metrics.get("win_rate_pct")
         win_rate_str = f"{float(win_rate):.1f}%" if win_rate is not None else "N/A"
@@ -314,7 +337,7 @@ def run_backtest_report(client: Optional[Any] = None, cached_data: Optional[Dict
 def run_calibration_training(
     years: int = 3,
     data: Optional[Dict[str, Any]] = None,
-    client: Optional[Any] = None,
+    client: Optional[Any] = _DEFAULT_CLIENT,
     offline: bool = False
 ) -> Dict[str, Any]:
     """
@@ -333,14 +356,17 @@ def run_calibration_training(
         sys.exit(1)
 
     # 1. Resolve database client with graceful fallback
-    if client is None:
-        try:
-            from src.db import get_supabase_client
-            client = get_supabase_client()
-            safe_print("🔗 Connected to Supabase Cloud for calibration persistence.")
-        except Exception as exc:
+    if client is _DEFAULT_CLIENT:
+        if not offline:
+            try:
+                from src.db import get_supabase_client
+                client = get_supabase_client()
+                safe_print("🔗 Connected to Supabase Cloud for calibration persistence.")
+            except Exception as exc:
+                client = None
+                safe_print(f"ℹ️  Supabase offline ({exc}). Operating with local JSON storage resilience.")
+        else:
             client = None
-            safe_print(f"ℹ️  Supabase offline ({exc}). Operating with local JSON storage resilience.")
 
     # 2. Ingest historical universe daily OHLCV bars
     if data is None:

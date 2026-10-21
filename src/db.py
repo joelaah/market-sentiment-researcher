@@ -456,13 +456,31 @@ def load_calibrated_parameters(
                 row = res.data[0]
                 raw_params = row.get("parameters")
                 if isinstance(raw_params, dict) and raw_params:
-                    # Update local cache mirror
+                    # Update local cache mirror preserving existing metadata such as status
                     try:
                         cache_file = _get_calibrated_params_file()
                         cache = _safe_read_json(cache_file, default={})
                         if not isinstance(cache, dict):
                             cache = {}
-                        cache[bot_id] = row
+                        existing_entry = cache.get(bot_id, {})
+                        merged_entry = dict(existing_entry) if isinstance(existing_entry, dict) else {}
+                        merged_entry.update(row)
+                        if "status" not in merged_entry or not merged_entry["status"]:
+                            try:
+                                from src.calibration import check_overfitting_gate
+                                is_m = merged_entry.get("in_sample_metrics") or {}
+                                oos = merged_entry.get("out_of_sample_metrics") or {}
+                                is_overfit, _ = check_overfitting_gate(is_m, oos)
+                                merged_entry["status"] = "degraded" if is_overfit else "optimal"
+                            except Exception:
+                                oos = merged_entry.get("out_of_sample_metrics") or {}
+                                oos_ret = float(oos.get("net_return_pct", 0.0))
+                                oos_pf = float(oos.get("profit_factor", 0.0))
+                                if oos_ret <= 0.0 or oos_pf < 1.0:
+                                    merged_entry["status"] = "degraded"
+                                else:
+                                    merged_entry["status"] = "optimal"
+                        cache[bot_id] = merged_entry
                         _atomic_write_json(cache_file, cache)
                     except Exception:
                         pass

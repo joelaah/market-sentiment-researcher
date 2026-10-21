@@ -257,6 +257,36 @@ class ObjectiveFunction:
         )
 
 
+def check_overfitting_gate(
+    is_metrics: Dict[str, Any],
+    oos_metrics: Dict[str, Any]
+) -> Tuple[bool, str]:
+    """
+    Evaluates whether a candidate strategy exhibits overfitting or alpha degradation.
+
+    Returns (is_overfitted: bool, reason: str).
+    Flagged as overfitted / degraded if:
+    1. OOS return is non-positive (oos_ret <= 0.0)
+    2. OOS profit factor < 1.0
+    3. Severe alpha decay: strong IS return (> 5.0%) but OOS return drops below 25% of IS return
+    4. Classic overfitting: strong IS return (> 5.0%) but deeply negative OOS (< -2.0%)
+    """
+    is_ret = float(is_metrics.get("net_return_pct", 0.0))
+    oos_ret = float(oos_metrics.get("net_return_pct", 0.0))
+    oos_pf = float(oos_metrics.get("profit_factor", 0.0))
+
+    if oos_ret <= 0.0:
+        return True, f"Non-positive out-of-sample return ({oos_ret:.2f}%)"
+    if oos_pf < 1.0:
+        return True, f"Out-of-sample profit factor under 1.0 ({oos_pf:.2f})"
+    if is_ret > 5.0 and oos_ret < 0.25 * is_ret:
+        return True, f"Severe alpha decay: OOS return ({oos_ret:.2f}%) < 25% of IS return ({is_ret:.2f}%)"
+    if is_ret > 5.0 and oos_ret < -2.0:
+        return True, f"Classic overfitting: IS return {is_ret:.2f}% vs OOS return {oos_ret:.2f}%"
+
+    return False, "Strategy is robust across in-sample and out-of-sample windows"
+
+
 # ============================================================================
 # WALK-FORWARD CALIBRATOR ENGINE
 # ============================================================================
@@ -425,9 +455,11 @@ class WalkForwardCalibrator:
         full_metrics = full_res["bots"][bot_id]["metrics"]
 
         # Overfitting diagnosis
-        is_ret = float(best_candidate["is_metrics"].get("net_return_pct", 0.0))
-        oos_ret = float(best_oos_metrics.get("net_return_pct", 0.0))
-        is_overfitted = bool(is_ret > 5.0 and oos_ret < -2.0)
+        is_overfitted, overfit_reason = check_overfitting_gate(
+            best_candidate["is_metrics"],
+            best_oos_metrics
+        )
+        has_degraded_oos = is_overfitted
 
         # Status categorization
         total_trades_is = int(best_candidate["is_metrics"].get("total_trades", 0))

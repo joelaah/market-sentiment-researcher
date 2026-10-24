@@ -227,7 +227,7 @@ class NiftyRelevanceChecker:
 
     def _get_finbert(self) -> FinBERTAnalyzer:
         if self._finbert is None:
-            self._finbert = FinBERTAnalyzer()
+            self._finbert = FinBERTAnalyzer.get_instance()
         return self._finbert
 
     def _get_anchor_embeddings(self) -> List[List[float]]:

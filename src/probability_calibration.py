@@ -47,6 +47,7 @@ class TemperatureScaler:
     """
 
     DEFAULT_TEMPERATURE = 1.5  # Sensible default that softens overconfident outputs
+    CALIBRATION_METHOD = "temperature_scaling"
 
     def __init__(self, temperature: float = 1.0):
         """
@@ -211,6 +212,8 @@ class PlattCalibrator:
     labels for each class. More flexible than temperature scaling but requires
     more validation data.
     """
+
+    CALIBRATION_METHOD = "platt_scaling"
 
     def __init__(self):
         self._params: Dict[int, Tuple[float, float]] = {}  # class_idx -> (A, B)

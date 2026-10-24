@@ -35,6 +35,8 @@ import re
 from pathlib import Path
 from tabulate import tabulate
 import yfinance as yf
+import numpy as np
+from src.fusion_engine import get_fusion_engine
 
 # Ensure UTF-8 / safe character encoding for Windows consoles
 if sys.platform.startswith("win"):
@@ -310,8 +312,28 @@ def calculate_probability_weighted_upside(
             c_clarity += 0.30
     c_clarity = max(0.05, min(1.00, c_clarity))
 
-    # Combined Upside Probability P_upside [0.05, 0.98]
-    p_upside = round(0.40 * p_sentiment + 0.35 * p_tech + 0.25 * c_clarity, 4)
+    # Multi-Modal Fusion Engine: Predict learned forward trade edge probability
+    fusion_engine = get_fusion_engine()
+    p_upside = fusion_engine.predict_edge_probability(
+        symbol=symbol,
+        price=price,
+        tech=tech,
+        bert=bert,
+        articles=articles,
+        net_sentiment=net,
+        positive_prob=pos,
+        negative_prob=neg,
+        c_clarity=c_clarity,
+        catalyst_clarity=c_clarity,
+        p_sentiment=p_sentiment,
+        p_tech=p_tech,
+        rsi_14=tech.get("rsi_14", tech.get("rsi", 50.0)),
+        momentum_5d=mom_5d,
+        volume_z_score=tech.get("volume_z_score", 0.0),
+        atr_volatility=tech.get("atr_volatility", 0.0),
+        above_sma20=above_sma,
+    )
+    p_upside = round(float(p_upside), 4)
     p_upside = max(0.05, min(0.98, p_upside))
     upside_prob_pct = round(p_upside * 100, 1)
 
@@ -353,11 +375,15 @@ def calculate_probability_weighted_upside(
         "symbol": symbol,
         "price": price,
         "sentiment_prob": round(p_sentiment, 4),
+        "p_sentiment": round(p_sentiment, 4),
         "technical_prob": round(p_tech, 4),
+        "p_tech": round(p_tech, 4),
         "catalyst_clarity": round(c_clarity, 4),
+        "c_clarity": round(c_clarity, 4),
         "catalyst_label": catalyst_label,
         "upside_probability": p_upside,
         "upside_probability_pct": upside_prob_pct,
+        "edge_probability": p_upside,
         "cap_tier": cap_tier,
         "potential_upside_pct": potential_upside_pct,
         "expected_return_pct": expected_return_pct,
@@ -447,7 +473,8 @@ def get_current_price(symbol: str) -> Optional[float]:
 
 def get_stock_market_metrics(symbol: str) -> Dict[str, Any]:
     """
-    Fetches real-time price, trading volume, market cap, and technical indicators (SMA20, 5d momentum).
+    Fetches real-time price, trading volume, market cap, and technical indicators
+    (SMA20, 5d momentum, 14-period RSI, 20-day Volume Z-Score, 14-period normalized ATR volatility).
     """
     res = {
         "valid": False,
@@ -457,6 +484,10 @@ def get_stock_market_metrics(symbol: str) -> Dict[str, Any]:
         "sma20": 0.0,
         "above_sma20": False,
         "momentum_5d": 0.0,
+        "rsi_14": 50.0,
+        "rsi": 50.0,
+        "volume_z_score": 0.0,
+        "atr_volatility": 0.0,
         "currency": "INR" if is_inr_symbol(symbol) else "USD"
     }
     try:
@@ -494,10 +525,58 @@ def get_stock_market_metrics(symbol: str) -> Dict[str, Any]:
                 res["momentum_5d"] = mom_5d
                 res["valid"] = True
 
-        if not hist.empty and "Volume" in hist and res["volume"] <= 0:
+                # Rolling 14-period RSI (clean fallback to 50.0 when bar history is short)
+                if len(valid_closes) >= 2:
+                    diffs = valid_closes.diff().dropna()
+                    lookback_rsi = min(14, len(diffs))
+                    recent_diffs = diffs.tail(lookback_rsi)
+                    gains = recent_diffs.clip(lower=0.0)
+                    losses = (-recent_diffs).clip(lower=0.0)
+                    avg_gain = float(gains.mean()) if not gains.empty else 0.0
+                    avg_loss = float(losses.mean()) if not losses.empty else 0.0
+                    if avg_loss == 0.0:
+                        rsi_val = 100.0 if avg_gain > 0.0 else 50.0
+                    else:
+                        rs = avg_gain / avg_loss
+                        rsi_val = 100.0 - (100.0 / (1.0 + rs))
+                    rsi_clean = round(float(np.clip(rsi_val, 0.0, 100.0)), 2)
+                    res["rsi_14"] = rsi_clean
+                    res["rsi"] = rsi_clean
+
+                # Rolling 14-period normalized ATR volatility (with clean fallback when bar history is short)
+                if len(valid_closes) >= 2:
+                    if "High" in hist and "Low" in hist:
+                        highs = hist["High"].dropna()
+                        lows = hist["Low"].dropna()
+                        prev_closes = valid_closes.shift(1)
+                        tr1 = highs - lows
+                        tr2 = (highs - prev_closes).abs()
+                        tr3 = (lows - prev_closes).abs()
+                        tr = np.maximum(tr1, np.maximum(tr2, tr3)).dropna()
+                    else:
+                        tr = valid_closes.diff().abs().dropna()
+
+                    lookback_atr = min(14, len(tr))
+                    if lookback_atr > 0 and cur_price > 0:
+                        atr_val = float(tr.tail(lookback_atr).mean())
+                        natr_pct = round(float((atr_val / cur_price) * 100.0), 2)
+                        res["atr_volatility"] = float(np.clip(natr_pct, 0.0, 20.0))
+
+        # Rolling 20-day Volume Z-Score (with clean fallback when bar history is short or std == 0)
+        if not hist.empty and "Volume" in hist:
             valid_vols = hist["Volume"].dropna()
             if not valid_vols.empty:
-                res["volume"] = float(valid_vols.iloc[-1])
+                cur_vol = float(valid_vols.iloc[-1])
+                if res["volume"] <= 0:
+                    res["volume"] = cur_vol
+                lookback_vol = min(20, len(valid_vols))
+                if lookback_vol >= 5:
+                    recent_vols = valid_vols.tail(lookback_vol)
+                    vol_mean = float(recent_vols.mean())
+                    vol_std = float(recent_vols.std(ddof=0))
+                    if vol_std > 1e-6:
+                        z_score = round(float((cur_vol - vol_mean) / vol_std), 2)
+                        res["volume_z_score"] = float(np.clip(z_score, -3.0, 3.0))
     except Exception as e:
         safe_print(f"[MarketData] Error fetching metrics for {symbol}: {e}")
     return res
@@ -568,7 +647,8 @@ class MarketSnapshot:
         cls,
         client: Optional[Any],
         watchlist: Optional[List[str]] = None,
-        guardrail: Optional[BorderlistGuardrail] = None
+        guardrail: Optional[BorderlistGuardrail] = None,
+        finbert: Optional[FinBERTAnalyzer] = None,
     ) -> "MarketSnapshot":
         """Builds a market snapshot across candidate tickers with guardrails and upside ranking."""
         safe_print("\n--- 📡 Capturing Live Market Snapshot for Tournament Arena ---")
@@ -635,11 +715,11 @@ class MarketSnapshot:
         upside_metrics: Dict[str, Dict[str, Any]] = {}
         border_filter = guardrail or BorderlistGuardrail()
 
-        finbert = None
-        try:
-            finbert = FinBERTAnalyzer()
-        except Exception as e:
-            safe_print(f"[FinBERT] Note: Initialized in keyword fallback mode ({e})")
+        if finbert is None:
+            try:
+                finbert = FinBERTAnalyzer.get_instance()
+            except Exception as e:
+                safe_print(f"[FinBERT] Note: Initialized in keyword fallback mode ({e})")
 
         for ticker in base_candidates:
             # 1. Fetch Market Metrics (Price, Volume, Market Cap, Technicals)

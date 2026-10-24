@@ -537,7 +537,7 @@ def calibrate_all_personas(
 
     # Load 3-year universe data if not supplied
     if data is None:
-        fetcher = HistoricalDataFetcher(offline_only=offline)
+        fetcher = HistoricalDataFetcher(offline=offline)
         universe_symbols = ["^NSEI", "NIFTYBEES.NS", "NVDA", "AAPL", "MSFT", "SPY"]
         data = fetcher.fetch_universe_bars(symbols=universe_symbols, years=years)
 

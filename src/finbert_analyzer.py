@@ -48,6 +48,32 @@ class FinBERTAnalyzer:
         if calibrator is not None:
             self.calibrator = calibrator
 
+    @classmethod
+    def get_instance(
+        cls,
+        temperature: Optional[float] = None,
+        calibrator: Optional[Any] = None,
+    ) -> "FinBERTAnalyzer":
+        """
+        Thread-safe singleton accessor for FinBERTAnalyzer.
+        If an instance already exists, updates temperature/calibrator if explicitly provided.
+        """
+        if cls._instance is None:
+            cls._instance = cls(temperature=temperature, calibrator=calibrator)
+        else:
+            if temperature is not None:
+                if temperature <= 0:
+                    raise ValueError(f"Temperature must be positive, got {temperature}")
+                cls._instance.temperature = float(temperature)
+            if calibrator is not None:
+                cls._instance.calibrator = calibrator
+        return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Resets the singleton instance (useful for unit testing)."""
+        cls._instance = None
+
     def _load_model(self):
         if not HAS_TORCH or AutoTokenizer is None or AutoModelForSequenceClassification is None:
             raise ImportError(

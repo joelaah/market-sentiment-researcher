@@ -16,12 +16,35 @@ Hierarchy:
 import logging
 import math
 import os
+import json
 import threading
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    pd = None
+    HAS_PANDAS = False
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    HAS_PYARROW = True
+except ImportError:
+    pa = None
+    pq = None
+    HAS_PYARROW = False
+
 logger = logging.getLogger("MultiModalFusionEngine")
+
+DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+FEEDBACK_PARQUET_FILE = DATA_DIR / "trade_feedback.parquet"
+FEEDBACK_JSON_FILE = DATA_DIR / "trade_feedback.json"
+
 
 # Optional Tier 1: LightGBM
 try:
@@ -215,6 +238,97 @@ class NumpyFusionFallback:
         prob = float(self._sigmoid(z))
         return float(np.clip(prob, 0.0, 1.0))
 
+    def update_from_feedback(
+        self,
+        feedback_samples: List[Tuple[Dict[str, Any], int]],
+        learning_rate: float = 0.05,
+        loss_penalty_multiplier: float = 1.5,
+        epochs: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Updates weights via asymmetric error gradient descent on trade feedback.
+        Penalizes feature combinations that led to stopped-out trades (y=0) more heavily
+        than rewarding winning trades (y=1).
+        Preserves the strict monotonicity invariant: w_sent >= 0.10.
+        """
+        if not feedback_samples:
+            return {"status": "no_samples", "samples": 0}
+
+        initial_w = {
+            "w_sent": self.w_sent, "w_pos": self.w_pos, "w_neg": self.w_neg,
+            "w_rsi": self.w_rsi, "w_mom": self.w_mom, "w_vol": self.w_vol,
+            "w_above": self.w_above, "w_atr": self.w_atr, "w_clarity": self.w_clarity,
+            "w_anchor": self.w_anchor, "w_0": self.w_0
+        }
+
+        for _ in range(epochs):
+            for features, label in feedback_samples:
+                y = float(label)
+                z = self.compute_logit(features)
+                p = float(self._sigmoid(z))
+
+                # Asymmetric mistake penalty: mistakes (y=0) are scaled by loss_penalty_multiplier
+                err = p - y
+                if y == 0.0:
+                    err *= float(loss_penalty_multiplier)
+
+                # Feature values
+                net = float(np.clip(features.get("net_sentiment", 0.0), -1.0, 1.0))
+                pos = float(np.clip(features.get("positive_prob", 0.33), 0.0, 1.0))
+                neg = float(np.clip(features.get("negative_prob", 0.33), 0.0, 1.0))
+                rsi = float(np.clip(features.get("rsi_14", 50.0), 0.0, 100.0))
+                norm_rsi = (rsi - 50.0) / 25.0
+                mom = float(np.clip(features.get("momentum_5d", 0.0), -20.0, 20.0))
+                norm_mom = mom / 5.0
+                vol_z = float(np.clip(features.get("volume_z_score", 0.0), -3.0, 3.0))
+                above = 1.0 if features.get("above_sma20", False) else 0.0
+                atr = float(np.clip(features.get("atr_volatility", 0.0), 0.0, 15.0))
+                clarity = float(np.clip(features.get("catalyst_clarity", 0.10), 0.05, 1.0))
+                anchor = float(np.clip(features.get("text_anchor_similarity", 0.0), -1.0, 1.0))
+
+                step = learning_rate * err
+
+                # Weight updates
+                self.w_0 -= step
+                self.w_sent -= step * net
+                self.w_pos -= step * pos
+                self.w_neg += step * neg
+                self.w_rsi -= step * norm_rsi
+                self.w_mom -= step * norm_mom
+                self.w_vol -= step * vol_z
+                self.w_above -= step * above
+                self.w_atr += step * atr
+                self.w_clarity -= step * clarity
+                self.w_anchor -= step * anchor
+
+                # Monotonicity & stability guards
+                self.w_sent = float(max(0.10, min(5.0, self.w_sent)))
+                self.w_pos = float(max(0.0, min(3.0, self.w_pos)))
+                self.w_neg = float(max(0.0, min(3.0, self.w_neg)))
+                self.w_rsi = float(np.clip(self.w_rsi, -2.0, 2.0))
+                self.w_mom = float(np.clip(self.w_mom, -2.0, 2.0))
+                self.w_vol = float(np.clip(self.w_vol, -2.0, 2.0))
+                self.w_above = float(np.clip(self.w_above, -2.0, 2.0))
+                self.w_atr = float(np.clip(self.w_atr, 0.0, 2.0))
+                self.w_clarity = float(np.clip(self.w_clarity, 0.0, 2.0))
+                self.w_anchor = float(np.clip(self.w_anchor, -2.0, 2.0))
+                self.w_0 = float(np.clip(self.w_0, -3.0, 3.0))
+
+        updated_w = {
+            "w_sent": self.w_sent, "w_pos": self.w_pos, "w_neg": self.w_neg,
+            "w_rsi": self.w_rsi, "w_mom": self.w_mom, "w_vol": self.w_vol,
+            "w_above": self.w_above, "w_atr": self.w_atr, "w_clarity": self.w_clarity,
+            "w_anchor": self.w_anchor, "w_0": self.w_0
+        }
+
+        return {
+            "status": "updated",
+            "samples": len(feedback_samples),
+            "initial_weights": initial_w,
+            "updated_weights": updated_w
+        }
+
+
 
 # ============================================================================
 # TIER 2: SCIKIT-LEARN LOGISTIC REGRESSION MODEL
@@ -229,6 +343,8 @@ class SklearnFusionModel:
     def __init__(self):
         self.model: Optional[Any] = None
         self._fitted = False
+        self._baseline_X: Optional[np.ndarray] = None
+        self._baseline_y: Optional[np.ndarray] = None
         self._initialize_default_model()
 
     def _initialize_default_model(self):
@@ -285,10 +401,42 @@ class SklearnFusionModel:
             clf.fit(X, y)
             self.model = clf
             self._fitted = True
+            self._baseline_X = X
+            self._baseline_y = y
         except Exception as e:
             logger.warning(f"Could not initialize SklearnFusionModel: {e}")
             self.model = None
             self._fitted = False
+
+    def update_with_feedback(
+        self,
+        X_feedback: np.ndarray,
+        y_feedback: np.ndarray,
+        loss_penalty_multiplier: float = 1.5,
+    ) -> bool:
+        """
+        Incorporates feedback via experience replay:
+        Combines baseline calibration distribution with feedback samples
+        to prevent catastrophic forgetting and maintain sentiment monotonicity.
+        """
+        if not self.is_available() or self._baseline_X is None or self._baseline_y is None:
+            return False
+        try:
+            weights_fb = np.where(y_feedback == 0, float(loss_penalty_multiplier), 1.0)
+            X_combined = np.vstack([self._baseline_X, X_feedback])
+            y_combined = np.concatenate([self._baseline_y, y_feedback])
+            w_combined = np.concatenate([np.ones(len(self._baseline_y)), weights_fb])
+
+            clf = LogisticRegression(C=1.0, max_iter=200, random_state=42)
+            clf.fit(X_combined, y_combined, sample_weight=w_combined)
+            # Ensure sentiment coefficient preserves positive monotonicity
+            if hasattr(clf, "coef_") and clf.coef_[0, 0] > 0.05:
+                self.model = clf
+                return True
+            return False
+        except Exception as e:
+            logger.warning(f"Failed to update SklearnFusionModel with feedback: {e}")
+            return False
 
     def is_available(self) -> bool:
         return HAS_SKLEARN and self.model is not None and self._fitted
@@ -714,6 +862,167 @@ class MultiModalFusionEngine:
             probs[i] = self.predict_edge_probability(features=features_dict)
 
         return np.column_stack([1.0 - probs, probs])
+
+    def incorporate_trade_feedback(
+        self,
+        feedback_data: Optional[Union[List[Dict[str, Any]], Any, str, Path]] = None,
+        learning_rate: float = 0.05,
+        loss_penalty_multiplier: float = 1.5,
+        epochs: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Incorporates trade feedback (experience replay / mistake learning) into the fusion models.
+        Penalizes feature combinations that resulted in stopped-out trades (y=0) while reinforcing
+        winning setups (y=1). Preserves mathematical monotonicity across all tiers.
+        """
+        records: List[Dict[str, Any]] = []
+
+        if feedback_data is None:
+            if FEEDBACK_PARQUET_FILE.exists() and HAS_PANDAS:
+                try:
+                    df = pd.read_parquet(FEEDBACK_PARQUET_FILE)
+                    records = df.to_dict(orient="records")
+                except Exception as e:
+                    logger.warning(f"Failed to read parquet feedback file {FEEDBACK_PARQUET_FILE}: {e}")
+            if not records and FEEDBACK_JSON_FILE.exists():
+                try:
+                    with open(FEEDBACK_JSON_FILE, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            records = data
+                except Exception as e:
+                    logger.warning(f"Failed to read json feedback file {FEEDBACK_JSON_FILE}: {e}")
+        elif isinstance(feedback_data, (str, Path)):
+            p = Path(feedback_data)
+            if p.suffix == ".parquet" and HAS_PANDAS:
+                df = pd.read_parquet(p)
+                records = df.to_dict(orient="records")
+            elif p.suffix == ".json" or p.exists():
+                with open(p, "r", encoding="utf-8") as f:
+                    records = json.load(f)
+        elif hasattr(feedback_data, "to_dict"):
+            records = feedback_data.to_dict(orient="records")
+        elif isinstance(feedback_data, list):
+            records = list(feedback_data)
+
+        if not records:
+            return {
+                "status": "no_data",
+                "samples_processed": 0,
+                "message": "No trade feedback data found to incorporate"
+            }
+
+        feedback_samples: List[Tuple[Dict[str, Any], int]] = []
+        for r in records:
+            label_val = r.get("label")
+            if label_val is None:
+                pnl_val = float(r.get("pnl", r.get("realized_pnl", 0.0)))
+                label_val = 1 if pnl_val > 0 else 0
+            feedback_samples.append((r, int(label_val)))
+
+        # Update pure-NumPy fallback (Tier 3)
+        np_res = self.numpy_fallback.update_from_feedback(
+            feedback_samples=feedback_samples,
+            learning_rate=learning_rate,
+            loss_penalty_multiplier=loss_penalty_multiplier,
+            epochs=epochs,
+        )
+
+        wins = sum(1 for _, l in feedback_samples if l == 1)
+        losses = sum(1 for _, l in feedback_samples if l == 0)
+
+        # Update Tier 2 if available
+        sklearn_updated = False
+        if HAS_SKLEARN and self.sklearn_model and self.sklearn_model.is_available() and len(feedback_samples) >= 4:
+            try:
+                X_list = []
+                y_list = []
+                for feat, lbl in feedback_samples:
+                    _, fvec, _ = self.extract_features(feat)
+                    X_list.append(fvec)
+                    y_list.append(lbl)
+                X_arr = np.array(X_list)
+                y_arr = np.array(y_list)
+                if len(np.unique(y_arr)) > 1:
+                    sklearn_updated = self.sklearn_model.update_with_feedback(
+                        X_arr, y_arr, loss_penalty_multiplier=loss_penalty_multiplier
+                    )
+            except Exception as e:
+                logger.warning(f"Sklearn model update on feedback skipped: {e}")
+
+        return {
+            "status": "success",
+            "samples_processed": len(feedback_samples),
+            "wins": wins,
+            "losses": losses,
+            "active_tier": self.active_tier,
+            "loss_penalty_applied": True,
+            "loss_penalty_multiplier": loss_penalty_multiplier,
+            "numpy_fallback_update": np_res,
+            "sklearn_updated": sklearn_updated,
+        }
+
+    def train_on_feedback(self, *args, **kwargs) -> Dict[str, Any]:
+        """Alias for incorporate_trade_feedback."""
+        return self.incorporate_trade_feedback(*args, **kwargs)
+
+    def retrain(
+        self,
+        X: Union[np.ndarray, List[Dict[str, Any]], List[Tuple[Dict[str, Any], int]], Any],
+        y: Optional[Union[np.ndarray, List[int]]] = None,
+        learning_rate: float = 0.05,
+        epochs: int = 5,
+    ) -> Dict[str, Any]:
+        """
+        Retrains the fusion engine on a dataset of feature dictionaries, tuples, or arrays.
+        """
+        samples: List[Tuple[Dict[str, Any], int]] = []
+        if isinstance(X, list) and (y is None or len(y) == 0):
+            for item in X:
+                if isinstance(item, tuple) and len(item) == 2:
+                    samples.append((item[0], int(item[1])))
+                elif isinstance(item, dict):
+                    lbl = int(item.get("label", 1 if float(item.get("pnl", 0.0)) > 0 else 0))
+                    samples.append((item, lbl))
+        elif y is not None:
+            if isinstance(X, np.ndarray):
+                for i in range(len(X)):
+                    row = X[i]
+                    fdict = {name: float(row[j]) for j, name in enumerate(FEATURE_NAMES) if j < len(row)}
+                    samples.append((fdict, int(y[i])))
+            elif isinstance(X, list):
+                for i in range(len(X)):
+                    samples.append((X[i], int(y[i])))
+
+        if not samples:
+            return {"status": "error", "message": "Invalid training input or empty samples"}
+
+        np_res = self.numpy_fallback.update_from_feedback(samples, learning_rate=learning_rate, epochs=epochs)
+
+        # Also update Sklearn if available
+        sklearn_updated = False
+        if HAS_SKLEARN and self.sklearn_model and self.sklearn_model.is_available() and len(samples) >= 4:
+            try:
+                X_list = []
+                y_list = []
+                for feat, lbl in samples:
+                    _, fvec, _ = self.extract_features(feat)
+                    X_list.append(fvec)
+                    y_list.append(lbl)
+                X_arr = np.array(X_list)
+                y_arr = np.array(y_list)
+                if len(np.unique(y_arr)) > 1:
+                    sklearn_updated = self.sklearn_model.update_with_feedback(X_arr, y_arr)
+            except Exception:
+                pass
+
+        return {
+            "status": "success",
+            "samples": len(samples),
+            "numpy_update": np_res,
+            "sklearn_updated": sklearn_updated,
+            "monotonic_weight_sent": self.numpy_fallback.w_sent,
+        }
 
 
 # ============================================================================

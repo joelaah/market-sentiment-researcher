@@ -25,18 +25,34 @@ Features:
    and best trades for CLI and GitHub Actions logs.
 """
 
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Union
 from decimal import Decimal
 from datetime import datetime, timezone
 import sys
 import os
 import json
 import re
+import uuid
+import threading
+import logging
 from pathlib import Path
 from tabulate import tabulate
 import yfinance as yf
 import numpy as np
+import pandas as pd
 from src.fusion_engine import get_fusion_engine
+
+logger_pt = logging.getLogger("PaperTrader")
+
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    HAS_PYARROW = True
+except ImportError:
+    pa = None
+    pq = None
+    HAS_PYARROW = False
+
 
 # Ensure UTF-8 / safe character encoding for Windows consoles
 if sys.platform.startswith("win"):
@@ -862,6 +878,10 @@ class BotArchetype:
         raw_ts = cfg.get("trailing_stop_pct", cfg.get("trailing_stop", None))
         self.trailing_stop_pct = abs(float(raw_ts)) if raw_ts is not None else None
 
+        # High-probability sniper entry thresholds
+        self.conviction_threshold = float(cfg.get("conviction_threshold", cfg.get("min_conviction", 7.5)))
+        self.min_upside_probability = float(cfg.get("min_upside_probability", 0.70))
+
         # Persona-specific overrides dictionary
         self.params: Dict[str, Any] = {
             "starting_balance": self.starting_balance,
@@ -871,6 +891,8 @@ class BotArchetype:
             "stop_loss_pct": self.stop_loss_pct,
             "take_profit_pct": self.take_profit_pct,
             "trailing_stop_pct": self.trailing_stop_pct,
+            "conviction_threshold": self.conviction_threshold,
+            "min_upside_probability": self.min_upside_probability,
             **cfg
         }
 
@@ -916,6 +938,10 @@ class BotArchetype:
             self.params["conviction_threshold"] = val
             if hasattr(self, "min_net_score") and self.bot_id == "finbert_catalyst_hunter":
                 self.min_net_score = val
+        if "min_upside_probability" in new_params:
+            val = float(new_params["min_upside_probability"])
+            self.min_upside_probability = val
+            self.params["min_upside_probability"] = val
         if "dip_threshold_pct" in new_params or "dip_max_pct" in new_params:
             val = float(new_params.get("dip_threshold_pct", new_params.get("dip_max_pct")))
             self.dip_max_pct = val
@@ -1381,6 +1407,95 @@ def get_default_tournament_bots(params_map: Optional[Dict[str, Dict[str, Any]]] 
 
 
 # ============================================================================
+# TRADE FEEDBACK STORE (EXPERIENCE REPLAY & MISTAKE LEARNING)
+# ============================================================================
+
+class TradeFeedbackStore:
+    """
+    Persists closed trade feedback (experience replay / mistake learning)
+    into `data/trade_feedback.parquet` with JSON fallback (`data/trade_feedback.json`).
+    Captures trade outcomes (PnL, win/loss label y in {0, 1}) alongside feature snapshots
+    from entry time (FinBERT logits, sentiment score, technical indicators, fusion probability).
+    """
+
+    def __init__(self, data_dir: Optional[Union[str, Path]] = None):
+        self.data_dir = Path(data_dir).resolve() if data_dir else DATA_DIR
+        self.parquet_path = self.data_dir / "trade_feedback.parquet"
+        self.json_path = self.data_dir / "trade_feedback.json"
+        self._lock = threading.Lock()
+        try:
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+    def record_feedback(self, record: Dict[str, Any]) -> None:
+        """
+        Appends a closed trade experience record to persistent storage.
+        Writes to JSON fallback first, and synchronizes to Parquet if PyArrow is available.
+        """
+        with self._lock:
+            existing = []
+            if self.json_path.exists():
+                try:
+                    with open(self.json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            existing = data
+                except Exception as e:
+                    logger_pt.warning(f"Error reading {self.json_path}: {e}")
+                    existing = []
+
+            existing.append(record)
+
+            try:
+                with open(self.json_path, "w", encoding="utf-8") as f:
+                    json.dump(existing, f, indent=2, default=str)
+            except Exception as e:
+                logger_pt.error(f"Failed to write trade feedback JSON: {e}")
+
+            try:
+                df = pd.DataFrame(existing)
+                if "label" in df.columns:
+                    df["label"] = df["label"].astype(int)
+                df.to_parquet(self.parquet_path, engine="pyarrow" if HAS_PYARROW else "auto", index=False)
+            except Exception as e:
+                logger_pt.debug(f"Parquet persistence skipped/failed (JSON fallback preserved): {e}")
+
+    def load_feedback(self) -> List[Dict[str, Any]]:
+        """Loads all recorded trade feedback experiences."""
+        with self._lock:
+            if self.parquet_path.exists():
+                try:
+                    df = pd.read_parquet(self.parquet_path)
+                    return df.to_dict(orient="records")
+                except Exception:
+                    pass
+            if self.json_path.exists():
+                try:
+                    with open(self.json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        if isinstance(data, list):
+                            return data
+                except Exception:
+                    pass
+            return []
+
+    def clear(self) -> None:
+        """Clears stored trade feedback."""
+        with self._lock:
+            if self.parquet_path.exists():
+                try:
+                    self.parquet_path.unlink()
+                except Exception:
+                    pass
+            if self.json_path.exists():
+                try:
+                    self.json_path.unlink()
+                except Exception:
+                    pass
+
+
+# ============================================================================
 # TOURNAMENT PERSISTENCE & DATA MANAGER
 # ============================================================================
 
@@ -1393,15 +1508,17 @@ class TournamentDataManager:
       persists other bots in a local JSON tournament cache (`data/bot_tournament_state.json`).
     - Ensures 100% crash-proof operation and backward compatibility.
     """
-    def __init__(self, client: Optional[Any] = None):
+    def __init__(self, client: Optional[Any] = None, data_dir: Optional[Union[str, Path]] = None):
         self.client = client
         self.has_supabase_bot_id = False
+        self.data_dir = Path(data_dir).resolve() if data_dir else DATA_DIR
+        self.state_file = self.data_dir / "bot_tournament_state.json"
         self._local_cache: Dict[str, Any] = {}
         self._init_storage()
 
     def _init_storage(self):
         """Initializes and detects database schema capabilities."""
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         self._load_local_cache()
 
         if self.client:
@@ -1420,19 +1537,19 @@ class TournamentDataManager:
                 )
 
     def _load_local_cache(self):
-        if LOCAL_STATE_FILE.exists():
+        if self.state_file.exists():
             try:
-                with open(LOCAL_STATE_FILE, "r", encoding="utf-8") as f:
+                with open(self.state_file, "r", encoding="utf-8") as f:
                     self._local_cache = json.load(f)
             except Exception as e:
-                safe_print(f"[Storage] Note: Error reading {LOCAL_STATE_FILE} ({e}), initializing fresh state.")
+                safe_print(f"[Storage] Note: Error reading {self.state_file} ({e}), initializing fresh state.")
                 self._local_cache = {}
         else:
             self._local_cache = {}
 
     def _save_local_cache(self):
         try:
-            with open(LOCAL_STATE_FILE, "w", encoding="utf-8") as f:
+            with open(self.state_file, "w", encoding="utf-8") as f:
                 json.dump(self._local_cache, f, indent=2)
         except Exception as e:
             safe_print(f"[Storage] Error writing local state: {e}")
@@ -1506,22 +1623,51 @@ class TournamentDataManager:
             self._save_local_cache()
 
     def get_positions(self, bot_id: str) -> List[Dict[str, Any]]:
-        """Returns open positions for a specific bot."""
+        """Returns open positions for a specific bot, enriching with cached entry features if needed."""
         if self.has_supabase_bot_id and self.client:
             res = self.client.table("paper_positions").select("*").eq("bot_id", bot_id).execute()
-            return res.data or []
+            positions = res.data or []
+            for p in positions:
+                if "entry_features" not in p:
+                    cached_f = self._local_cache.get(bot_id, {}).get("positions", {}).get(p.get("symbol"), {}).get("entry_features")
+                    if cached_f:
+                        p["entry_features"] = cached_f
+            return positions
         elif not self.has_supabase_bot_id and self.client and bot_id == "conservative_swing":
             res = self.client.table("paper_positions").select("*").execute()
-            return res.data or []
+            positions = res.data or []
+            for p in positions:
+                if "entry_features" not in p:
+                    cached_f = self._local_cache.get(bot_id, {}).get("positions", {}).get(p.get("symbol"), {}).get("entry_features")
+                    if cached_f:
+                        p["entry_features"] = cached_f
+            return positions
 
         # Local
         bot_data = self._local_cache.get(bot_id, {})
         pos_dict = bot_data.get("positions", {})
         return list(pos_dict.values())
 
-    def upsert_position(self, bot_id: str, symbol: str, shares: float, avg_price: float):
-        """Updates or adds an open position for a specific bot."""
+    def upsert_position(self, bot_id: str, symbol: str, shares: float, avg_price: float, entry_features: Optional[Dict[str, Any]] = None):
+        """Updates or adds an open position for a specific bot and preserves entry features."""
         now_iso = datetime.now(timezone.utc).isoformat()
+
+        # Always preserve entry features in local cache for experience replay
+        if bot_id not in self._local_cache:
+            self._local_cache[bot_id] = {"cash_balance": 5000.00, "initial_balance": 5000.00, "positions": {}, "trades": []}
+        cached_pos = self._local_cache[bot_id].setdefault("positions", {}).setdefault(symbol, {
+            "symbol": symbol,
+            "shares": shares,
+            "average_buy_price": avg_price,
+            "updated_at": now_iso,
+        })
+        cached_pos["shares"] = shares
+        cached_pos["average_buy_price"] = avg_price
+        cached_pos["updated_at"] = now_iso
+        if entry_features is not None:
+            cached_pos["entry_features"] = entry_features
+        self._save_local_cache()
+
         if self.has_supabase_bot_id and self.client:
             pos_res = self.client.table("paper_positions").select("*").eq("bot_id", bot_id).eq("symbol", symbol).execute()
             if pos_res.data:
@@ -1551,27 +1697,17 @@ class TournamentDataManager:
                     "shares": shares,
                     "average_buy_price": avg_price
                 }).execute()
-        else:
-            if bot_id not in self._local_cache:
-                self._local_cache[bot_id] = {"cash_balance": 5000.00, "initial_balance": 5000.00, "positions": {}, "trades": []}
-            self._local_cache[bot_id]["positions"][symbol] = {
-                "symbol": symbol,
-                "shares": shares,
-                "average_buy_price": avg_price,
-                "updated_at": now_iso
-            }
-            self._save_local_cache()
 
     def remove_position(self, bot_id: str, symbol: str):
         """Removes an open position upon full exit."""
+        if bot_id in self._local_cache and symbol in self._local_cache[bot_id].get("positions", {}):
+            del self._local_cache[bot_id]["positions"][symbol]
+            self._save_local_cache()
+
         if self.has_supabase_bot_id and self.client:
             self.client.table("paper_positions").delete().eq("bot_id", bot_id).eq("symbol", symbol).execute()
         elif not self.has_supabase_bot_id and self.client and bot_id == "conservative_swing":
             self.client.table("paper_positions").delete().eq("symbol", symbol).execute()
-        else:
-            if bot_id in self._local_cache and symbol in self._local_cache[bot_id].get("positions", {}):
-                del self._local_cache[bot_id]["positions"][symbol]
-                self._save_local_cache()
 
     def record_trade(self, bot_id: str, trade_data: Dict[str, Any]):
         """Records a simulated trade in audit history."""
@@ -1665,7 +1801,9 @@ class MultiBotTournamentEngine:
         self,
         bots: Optional[List[BotArchetype]] = None,
         client: Any = _DEFAULT_CLIENT,
-        auto_sync_params: bool = True
+        auto_sync_params: bool = True,
+        feedback_store: Optional[TradeFeedbackStore] = None,
+        data_dir: Optional[Union[str, Path]] = None,
     ):
         if client is _DEFAULT_CLIENT:
             try:
@@ -1675,7 +1813,8 @@ class MultiBotTournamentEngine:
         else:
             self.client = client
 
-        self.storage = TournamentDataManager(self.client)
+        self.storage = TournamentDataManager(self.client, data_dir=data_dir)
+        self.feedback_store = feedback_store or TradeFeedbackStore(data_dir=data_dir)
         self.guardrail = BorderlistGuardrail()
         self.watchlist = list(WATCHLIST)
         self.bots: Dict[str, BotArchetype] = {
@@ -1837,7 +1976,8 @@ class MultiBotTournamentEngine:
         rationale: str,
         current_price: Optional[float] = None,
         volume: Optional[float] = None,
-        market_cap: Optional[float] = None
+        market_cap: Optional[float] = None,
+        features_snapshot: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Simulates buying stock for a specific bot's independent fund with border guardrail verification."""
         bot = self.bots[bot_id]
@@ -1896,7 +2036,7 @@ class MultiBotTournamentEngine:
         new_cash = round(cash - actual_cost, 2)
         self.storage.update_cash_balance(bot_id, new_cash)
 
-        # 2. Update position
+        # 2. Update position with entry feature snapshot
         existing_positions = {p["symbol"]: p for p in self.storage.get_positions(bot_id)}
         if symbol in existing_positions:
             old_p = existing_positions[symbol]
@@ -1904,9 +2044,10 @@ class MultiBotTournamentEngine:
             old_price = float(old_p["average_buy_price"])
             new_shares = round(old_shares + shares, 4)
             blended_price = round(((old_shares * old_price) + (shares * price)) / new_shares, 2)
-            self.storage.upsert_position(bot_id, symbol, new_shares, blended_price)
+            merged_features = old_p.get("entry_features") or features_snapshot
+            self.storage.upsert_position(bot_id, symbol, new_shares, blended_price, entry_features=merged_features)
         else:
-            self.storage.upsert_position(bot_id, symbol, shares, price)
+            self.storage.upsert_position(bot_id, symbol, shares, price, entry_features=features_snapshot)
 
         # 3. Log Trade Audit
         self.storage.record_trade(bot_id, {
@@ -1937,7 +2078,7 @@ class MultiBotTournamentEngine:
         return True
 
     def execute_sell(self, bot_id: str, symbol: str, shares: float, rationale: str, current_price: Optional[float] = None) -> bool:
-        """Simulates selling a stock holding back to a bot's cash fund."""
+        """Simulates selling a stock holding back to a bot's cash fund and captures feedback."""
         bot = self.bots[bot_id]
         price = current_price or get_current_price(symbol)
         if not price or price <= 0:
@@ -1950,6 +2091,7 @@ class MultiBotTournamentEngine:
         pos = existing_positions[symbol]
         held_shares = float(pos["shares"])
         avg_buy_price = float(pos["average_buy_price"])
+        entry_features = pos.get("entry_features") or {}
         shares_to_sell = min(shares, held_shares)
         gross_proceeds = round(shares_to_sell * price, 2)
         cost_basis = round(shares_to_sell * avg_buy_price, 2)
@@ -1967,7 +2109,7 @@ class MultiBotTournamentEngine:
         if rem_shares <= 0.0001:
             self.storage.remove_position(bot_id, symbol)
         else:
-            self.storage.upsert_position(bot_id, symbol, rem_shares, avg_buy_price)
+            self.storage.upsert_position(bot_id, symbol, rem_shares, avg_buy_price, entry_features=entry_features)
 
         # 3. Log Trade Audit
         enhanced_rationale = f"[{bot.name}] {rationale} [PnL: {'+' if pnl >= 0 else ''}${pnl:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%)]"
@@ -1977,8 +2119,47 @@ class MultiBotTournamentEngine:
             "shares": shares_to_sell,
             "price": price,
             "total_value": gross_proceeds,
-            "rationale": enhanced_rationale
+            "rationale": enhanced_rationale,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
         })
+
+        # 4. Capture Trade Feedback for Experience Replay / Mistake Learning
+        win_label = 1 if pnl > 0 else 0
+        feedback_entry = {
+            "trade_id": str(uuid.uuid4()),
+            "bot_id": bot_id,
+            "symbol": symbol,
+            "action": "SELL",
+            "entry_price": avg_buy_price,
+            "exit_price": price,
+            "shares": shares_to_sell,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+            "label": win_label,
+            "exit_reason": rationale,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            # Snapshot of entry features
+            "net_sentiment": float(entry_features.get("net_sentiment", 0.0)),
+            "positive_prob": float(entry_features.get("positive_prob", 0.33)),
+            "negative_prob": float(entry_features.get("negative_prob", 0.33)),
+            "neutral_prob": float(entry_features.get("neutral_prob", 0.34)),
+            "sentiment_logit_pos": float(entry_features.get("sentiment_logit_pos", 0.0)),
+            "sentiment_logit_neg": float(entry_features.get("sentiment_logit_neg", 0.0)),
+            "sentiment_logit_neu": float(entry_features.get("sentiment_logit_neu", 0.0)),
+            "rsi_14": float(entry_features.get("rsi_14", 50.0)),
+            "momentum_5d": float(entry_features.get("momentum_5d", 0.0)),
+            "volume_z_score": float(entry_features.get("volume_z_score", 0.0)),
+            "atr_volatility": float(entry_features.get("atr_volatility", 0.0)),
+            "above_sma20": float(entry_features.get("above_sma20", 0.0)),
+            "catalyst_clarity": float(entry_features.get("catalyst_clarity", 0.10)),
+            "text_anchor_similarity": float(entry_features.get("text_anchor_similarity", 0.0)),
+            "fusion_probability": float(entry_features.get("fusion_probability", entry_features.get("edge_probability", 0.50))),
+        }
+        try:
+            self.feedback_store.record_feedback(feedback_entry)
+        except Exception as e:
+            logger_pt.warning(f"Could not record trade feedback: {e}")
 
         pnl_str = f"{'+' if pnl >= 0 else ''}${pnl:.2f} ({'+' if pnl_pct >= 0 else ''}{pnl_pct:.2f}%)"
         safe_print(f"🔴 [PAPER SELL] [{bot.name}] {shares_to_sell:.4f} shares of {symbol} @ ${price:.2f} (${gross_proceeds:.2f}) | PnL: {pnl_str}")
@@ -2117,11 +2298,35 @@ class MultiBotTournamentEngine:
                 if should_enter and ticker not in open_symbols and tradeable_target not in open_symbols:
                     # Enrich rationale with probability-weighted upside metrics
                     metrics = snapshot.upside_metrics.get(ticker, {})
+
+                    # High-probability sniper gate: require >= min_upside_probability (>= 70% model confidence)
+                    upside_prob = float(metrics.get("upside_probability", metrics.get("edge_probability", 0.0)))
+                    min_req_upside = getattr(bot, "min_upside_probability", 0.70)
+                    if upside_prob > 0.0 and upside_prob < min_req_upside:
+                        continue
+
                     upside_str = f" [Upside Prob: {metrics.get('upside_probability_pct', 0)}%, Exp Return: +{metrics.get('expected_return_pct', 0)}%, Tier: {metrics.get('cap_tier', 'N/A')}]"
                     full_rationale = f"{rationale}{upside_str}"
 
                     trade_allocation = round(min(refreshed_status["total_equity"] * bot.allocation_pct, bot.max_trade_dollars), 2)
                     if refreshed_status["cash"] >= trade_allocation:
+                        entry_features = {
+                            "net_sentiment": float(bert.get("net_score", bert.get("net_sentiment", 0.0))),
+                            "positive_prob": float(bert.get("positive", bert.get("positive_prob", 0.33))),
+                            "negative_prob": float(bert.get("negative", bert.get("negative_prob", 0.33))),
+                            "neutral_prob": float(bert.get("neutral", bert.get("neutral_prob", 0.34))),
+                            "sentiment_logit_pos": float(bert.get("logits", [0, 0, 0])[0]) if "logits" in bert and len(bert["logits"]) > 0 else 0.0,
+                            "sentiment_logit_neg": float(bert.get("logits", [0, 0, 0])[1]) if "logits" in bert and len(bert["logits"]) > 1 else 0.0,
+                            "sentiment_logit_neu": float(bert.get("logits", [0, 0, 0])[2]) if "logits" in bert and len(bert["logits"]) > 2 else 0.0,
+                            "rsi_14": float(tech.get("rsi_14", tech.get("rsi", 50.0))),
+                            "momentum_5d": float(tech.get("momentum_5d", 0.0)),
+                            "volume_z_score": float(tech.get("volume_z_score", 0.0)),
+                            "atr_volatility": float(tech.get("atr_volatility", 0.0)),
+                            "above_sma20": 1.0 if tech.get("above_sma20") else 0.0,
+                            "catalyst_clarity": float(metrics.get("catalyst_clarity", 0.10)),
+                            "text_anchor_similarity": float(metrics.get("text_anchor_similarity", 0.0)),
+                            "fusion_probability": float(metrics.get("edge_probability", metrics.get("upside_probability", 0.50))),
+                        }
                         self.execute_buy(
                             bot_id,
                             ticker,
@@ -2129,7 +2334,8 @@ class MultiBotTournamentEngine:
                             full_rationale,
                             current_price=price,
                             volume=snapshot.volumes.get(ticker),
-                            market_cap=snapshot.market_caps.get(ticker)
+                            market_cap=snapshot.market_caps.get(ticker),
+                            features_snapshot=entry_features,
                         )
                         # Re-update status so we don't exceed cash on subsequent candidate
                         refreshed_status = self.get_bot_status(bot_id, snapshot)

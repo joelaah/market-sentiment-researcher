@@ -438,6 +438,32 @@ def run_calibration_training(
     return calibration_output
 
 
+def run_rolling_retrain_cli(window_days: int = 90, offline: bool = True):
+    """Executes the automated rolling retraining engine from CLI."""
+    from src.rolling_retrainer import run_rolling_retraining
+    safe_print("\n" + "=" * 90)
+    safe_print(f"       🔄 AUTOMATED ROLLING RETRAINING & OVERFITTING GATE AUDIT ({window_days} BARS)       ")
+    safe_print("=" * 90)
+    res = run_rolling_retraining(window_days=window_days, offline=offline)
+    safe_print(f"Status: {res.get('status')} | Elapsed: {res.get('elapsed_seconds')}s | Offline: {res.get('offline')}")
+    safe_print(f"Evaluated Universe: {res.get('universe')}")
+    safe_print(f"Accepted Candidates: {res.get('accepted_count')} | Rejected (Overfitting Gate): {res.get('rejected_count')}\n")
+
+    table_rows = []
+    for bot_id, b_res in res.get("bot_evaluations", {}).items():
+        table_rows.append([
+            bot_id,
+            b_res.get("action", "unknown").upper(),
+            b_res.get("status", "unknown"),
+            b_res.get("reason", "")[:55]
+        ])
+    safe_print(tabulate(table_rows, headers=["Bot Persona", "Decision", "Status", "Gate Decision Rationale"], tablefmt="grid"))
+    f_res = res.get("fusion_retraining", {})
+    safe_print(f"\nMultiModalFusionEngine Retraining: Samples={f_res.get('samples_trained', 0)}, Monotonic w_sent={f_res.get('monotonic_weight_sent', 'N/A')}")
+    safe_print("=" * 90 + "\n")
+    return res
+
+
 def main():
     parser = argparse.ArgumentParser(description="Financial News Scraper, Supabase pgvector & Multi-Bot Trading Tournament")
     parser.add_argument("--scrape", action="store_true", help="Scrape latest financial news and index into Supabase")
@@ -452,6 +478,9 @@ def main():
     parser.add_argument("--train", action="store_true", help="Execute 3-year historical backtesting, training calibration, and walk-forward parameter optimization")
     parser.add_argument("--years", type=int, default=3, help="Historical lookback period in years for backtesting & calibration (default: 3)")
     parser.add_argument("--backtest-report", action="store_true", help="Display formatted historical backtesting performance comparison table across all 5 bot archetypes")
+    parser.add_argument("--rolling-retrain", action="store_true", help="Execute automated weekly rolling retraining & bot parameter recalibration")
+    parser.add_argument("--rolling-window-days", type=int, default=90, help="Rolling lookback window in trading days (default: 90)")
+    parser.add_argument("--offline", action="store_true", default=True, help="Operate strictly offline using cached bars (default: True)")
 
     args = parser.parse_args()
 
@@ -494,6 +523,9 @@ def main():
     elif args.train:
         run_calibration_training(years=args.years)
         sys.exit(0)
+    elif args.rolling_retrain:
+        run_rolling_retrain_cli(window_days=args.rolling_window_days, offline=args.offline)
+        sys.exit(0)
     elif args.backtest_report:
         run_backtest_report()
         sys.exit(0)
@@ -526,8 +558,9 @@ def main():
         print("6. Run Targeted News Relevance Checker (NIFTY)")
         print("7. Run Historical Training & Parameter Calibration")
         print("8. View Backtest Performance Report")
-        print("9. Exit")
-        choice = input("Select an option (1-9): ").strip()
+        print("9. Run Weekly Rolling Retraining & Overfitting Gate Audit")
+        print("10. Exit")
+        choice = input("Select an option (1-10): ").strip()
 
         if choice == "1":
             run_scraper_and_indexing()
@@ -546,6 +579,8 @@ def main():
             run_calibration_training(years=3)
         elif choice == "8":
             run_backtest_report()
+        elif choice == "9":
+            run_rolling_retrain_cli(window_days=90, offline=True)
         else:
             print("Exiting.")
 

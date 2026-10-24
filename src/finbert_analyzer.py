@@ -31,12 +31,14 @@ class FinBERTAnalyzer:
             cls._instance.model = None
             cls._instance.temperature = cls.DEFAULT_TEMPERATURE
             cls._instance.calibrator = None
+            cls._instance.adapter_path = None
         return cls._instance
 
     def __init__(
         self,
         temperature: Optional[float] = None,
         calibrator: Optional[Any] = None,
+        adapter_path: Optional[str] = None,
     ):
         if temperature is not None:
             if temperature <= 0:
@@ -48,18 +50,24 @@ class FinBERTAnalyzer:
         if calibrator is not None:
             self.calibrator = calibrator
 
+        if adapter_path is not None:
+            if hasattr(self, "adapter_path") and self.adapter_path != adapter_path and getattr(self, "model", None) is not None:
+                self.model = None  # Reload model with new adapter
+            self.adapter_path = adapter_path
+
     @classmethod
     def get_instance(
         cls,
         temperature: Optional[float] = None,
         calibrator: Optional[Any] = None,
+        adapter_path: Optional[str] = None,
     ) -> "FinBERTAnalyzer":
         """
         Thread-safe singleton accessor for FinBERTAnalyzer.
-        If an instance already exists, updates temperature/calibrator if explicitly provided.
+        If an instance already exists, updates temperature/calibrator/adapter_path if explicitly provided.
         """
         if cls._instance is None:
-            cls._instance = cls(temperature=temperature, calibrator=calibrator)
+            cls._instance = cls(temperature=temperature, calibrator=calibrator, adapter_path=adapter_path)
         else:
             if temperature is not None:
                 if temperature <= 0:
@@ -67,6 +75,10 @@ class FinBERTAnalyzer:
                 cls._instance.temperature = float(temperature)
             if calibrator is not None:
                 cls._instance.calibrator = calibrator
+            if adapter_path is not None:
+                if cls._instance.adapter_path != adapter_path and cls._instance.model is not None:
+                    cls._instance.model = None  # Reload model with new adapter
+                cls._instance.adapter_path = adapter_path
         return cls._instance
 
     @classmethod
@@ -82,7 +94,17 @@ class FinBERTAnalyzer:
         if self.model is None:
             print(f"[FinBERT] Loading financial sentiment classifier ({MODEL_NAME})...")
             self.tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-            self.model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+            base_model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+            if self.adapter_path and os.path.exists(self.adapter_path):
+                try:
+                    from peft import PeftModel
+                    self.model = PeftModel.from_pretrained(base_model, str(self.adapter_path))
+                    print(f"[FinBERT] Successfully loaded LoRA adapter from {self.adapter_path}")
+                except Exception as e:
+                    print(f"[FinBERT] Note: could not load PEFT adapter ({e}), using base model.")
+                    self.model = base_model
+            else:
+                self.model = base_model
             self.model.eval()
 
     def analyze(self, text: str, temperature: Optional[float] = None) -> Dict[str, Any]:

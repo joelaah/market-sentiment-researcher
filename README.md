@@ -25,7 +25,7 @@ An end-to-end Python pipeline designed for financial news ingestion, vector sema
 
 ### 1. Install Dependencies
 ```bash
-cd "D:\market-sentiment-researcher"
+
 python -m pip install -r requirements.txt
 ```
 
